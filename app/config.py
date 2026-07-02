@@ -19,8 +19,17 @@ class Settings(BaseSettings):
     watsonx_url: str = "https://us-south.ml.cloud.ibm.com"
     watsonx_model: str = "ibm/granite-3-8b-instruct"
 
+    openrouter_api_key: str = ""
+    openrouter_model: str = "meta-llama/llama-3.3-70b-instruct:free"
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+
     database_url: str = "sqlite+aiosqlite:///./it_automator.db"
     checkpoint_db_path: str = "./it_automator_checkpoints.db"
+
+    mcp_transport: str = "stdio"
+    mcp_server_url: str = "http://127.0.0.1:8765/mcp"
+    mcp_server_host: str = "127.0.0.1"
+    mcp_server_port: int = 8765
 
     sensitive_actions: str = "disable_user,revoke_access"
 
