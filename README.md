@@ -38,7 +38,9 @@ tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
     strips markdown fences/prose and raises a clear error (routed to a
     `FAILED` ticket state, not a crash) if the model doesn't return valid JSON.
 - **`app/api/`** — FastAPI endpoints to submit tickets, list/inspect them,
-  list/decide pending approvals, and pull the per-ticket audit trail.
+  list/decide pending approvals, and pull the per-ticket audit trail. All of
+  these (except `/health` and the static UI page) require an `X-API-Key`
+  header matching `API_KEY` in `.env` — see **Auth** below.
 - **`app/db/`** — SQLAlchemy models: `EmployeeUser` (mock IBM ID Management
   record), `Ticket`, `Approval`, `AuditLog`. SQLite by default (zero setup);
   swap `DATABASE_URL` for Postgres in production.
@@ -54,7 +56,9 @@ tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
 - **State management in long-running workflows**: the LangGraph checkpointer
   persists agent state across the interrupt/resume boundary, so approval can
   happen minutes or hours after the ticket was submitted, from a completely
-  separate HTTP request.
+  separate HTTP request — and across an application restart, since the
+  checkpointer is backed by a SQLite file (`CHECKPOINT_DB_PATH`), not kept
+  only in memory.
 
 ## Setup
 
@@ -65,7 +69,21 @@ pip install -r requirements.txt
 
 cp .env.example .env
 # then set GROQ_API_KEY (free key: https://console.groq.com/keys)
+# and set API_KEY to any secret string (required outside of local demo use)
 ```
+
+### Auth
+
+Every endpoint except `/health` and the static UI page (`GET /`) requires an
+`X-API-Key` header matching `API_KEY` in `.env`:
+
+```bash
+curl -X POST http://127.0.0.1:8000/tickets -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{...}'
+```
+
+The built-in dashboard prompts for the key once (on first load) and stores it
+in `localStorage`. If `API_KEY` is left blank, auth is disabled and the server
+logs a warning at startup — only do this for a fully local, single-user demo.
 
 Seed a couple of mock employees and run the API:
 
@@ -96,7 +114,7 @@ the [MCP Inspector](https://github.com/modelcontextprotocol/inspector).
 **1. Onboarding (no sensitive actions — completes immediately):**
 
 ```bash
-curl -X POST http://127.0.0.1:8000/tickets -H "Content-Type: application/json" -d '{
+curl -X POST http://127.0.0.1:8000/tickets -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{
   "requester": "hr@example.com",
   "subject": "Onboard new hire",
   "body": "Onboard Kevin Lee (username klee, email klee@example.com, dept Engineering) and grant VPN access."
@@ -106,7 +124,7 @@ curl -X POST http://127.0.0.1:8000/tickets -H "Content-Type: application/json" -
 **2. Offboarding (hits the HITL gate):**
 
 ```bash
-curl -X POST http://127.0.0.1:8000/tickets -H "Content-Type: application/json" -d '{
+curl -X POST http://127.0.0.1:8000/tickets -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{
   "requester": "hr@example.com",
   "subject": "Offboard employee",
   "body": "Offboard jsmith - disable her account, she left the company."
@@ -117,7 +135,7 @@ curl -X POST http://127.0.0.1:8000/tickets -H "Content-Type: application/json" -
 **3. A human reviews and decides:**
 
 ```bash
-curl -X POST http://127.0.0.1:8000/approvals/1/decide -H "Content-Type: application/json" -d '{
+curl -X POST http://127.0.0.1:8000/approvals/1/decide -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{
   "reviewer": "manager@example.com", "approve": true
 }'
 # -> graph resumes exactly where it paused; if the plan has more sensitive
@@ -127,7 +145,7 @@ curl -X POST http://127.0.0.1:8000/approvals/1/decide -H "Content-Type: applicat
 **4. Inspect what actually happened:**
 
 ```bash
-curl http://127.0.0.1:8000/tickets/1/audit
+curl http://127.0.0.1:8000/tickets/1/audit -H "X-API-Key: $API_KEY"
 ```
 
 ## Tests
@@ -136,9 +154,10 @@ curl http://127.0.0.1:8000/tickets/1/audit
 pytest -v
 ```
 
-28 tests covering: tool CRUD + audit logging, the approval-gate security
+37 tests covering: tool CRUD + audit logging, the approval-gate security
 boundary (tool/argument mismatch rejection, replay prevention, unknown/pending/
-rejected approval refusal), and the graph's routing/guardrail logic.
+rejected approval refusal), the graph's routing/guardrail logic, and the
+API-key auth dependency.
 
 ## Notes on model choice
 
