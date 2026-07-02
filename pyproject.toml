@@ -1,0 +1,27 @@
+[project]
+name = "mcp-it-automator"
+version = "0.1.0"
+description = "MCP-Enabled Enterprise IT Automator: a LangGraph agent that automates employee onboarding/offboarding via a custom MCP server, with human-in-the-loop approval for sensitive actions."
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=1.2.0",
+    "langgraph>=0.2.60",
+    "langchain-core>=0.3.28",
+    "langchain-groq>=0.2.3",
+    "fastapi>=0.115.6",
+    "uvicorn[standard]>=0.34.0",
+    "sqlalchemy>=2.0.36",
+    "pydantic>=2.10.4",
+    "pydantic-settings>=2.7.1",
+    "python-dotenv>=1.0.1",
+    "aiosqlite>=0.20.0",
+    "httpx>=0.28.1",
+]
+
+[project.optional-dependencies]
+postgres = ["asyncpg>=0.30.0"]
+dev = ["pytest>=8.3.4", "pytest-asyncio>=0.25.1"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+testpaths = ["tests"]
