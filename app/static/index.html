@@ -120,10 +120,29 @@ function toast(msg, isErr) {
   el._t = setTimeout(() => el.style.display = "none", 4000);
 }
 
+function escapeHtml(value) {
+  return String(value ?? "").replace(/[&<>"']/g, (ch) => ({
+    "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+  }[ch]));
+}
+
+function getApiKey() {
+  let key = localStorage.getItem("apiKey");
+  if (key === null) {
+    key = window.prompt("API key (leave blank if the server has no API_KEY configured):") || "";
+    localStorage.setItem("apiKey", key);
+  }
+  return key;
+}
+
 async function api(path, opts) {
-  const res = await fetch(API + path, Object.assign({
-    headers: { "Content-Type": "application/json" }
-  }, opts || {}));
+  const headers = { "Content-Type": "application/json" };
+  const key = getApiKey();
+  if (key) headers["X-API-Key"] = key;
+  const res = await fetch(API + path, Object.assign({ headers }, opts || {}));
+  if (res.status === 401) {
+    localStorage.removeItem("apiKey");
+  }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
     const msg = data.detail ? JSON.stringify(data.detail) : res.statusText;
@@ -183,11 +202,11 @@ async function renderApprovals() {
     el.innerHTML = approvals.map(a => `
       <div class="card">
         <div class="card-head">
-          <strong>#${a.id} · <code class="tool">${a.tool_name}</code></strong>
+          <strong>#${a.id} · <code class="tool">${escapeHtml(a.tool_name)}</code></strong>
           ${badge(a.status)}
         </div>
-        <div class="meta">Ticket #${a.ticket_id} · args: ${JSON.stringify(a.tool_args)}</div>
-        <div class="body-text">${a.reasoning || ""}</div>
+        <div class="meta">Ticket #${a.ticket_id} · args: ${escapeHtml(JSON.stringify(a.tool_args))}</div>
+        <div class="body-text">${escapeHtml(a.reasoning)}</div>
         <div class="row" style="margin-top:8px">
           <button class="approve" onclick="decide(${a.id}, true)">Approve</button>
           <button class="reject" onclick="decide(${a.id}, false)">Reject</button>
@@ -212,7 +231,7 @@ async function toggleAudit(ticketId, btn) {
   try {
     const rows = await api(`/tickets/${ticketId}/audit`);
     target.innerHTML = rows.length
-      ? rows.map(r => `<div class="audit-row">${r.created_at} · <code class="tool">${r.tool_name}</code> · ${r.success ? "ok" : "FAILED"} · ${r.result}</div>`).join("")
+      ? rows.map(r => `<div class="audit-row">${escapeHtml(r.created_at)} · <code class="tool">${escapeHtml(r.tool_name)}</code> · ${r.success ? "ok" : "FAILED"} · ${escapeHtml(r.result)}</div>`).join("")
       : `<p class="empty">No audit entries yet.</p>`;
   } catch (e) {
     target.innerHTML = `<p class="empty">Failed to load audit log: ${e.message}</p>`;
@@ -230,12 +249,12 @@ async function renderTickets() {
     el.innerHTML = tickets.map(t => `
       <div class="card">
         <div class="card-head">
-          <strong>#${t.id} · ${t.subject}</strong>
+          <strong>#${t.id} · ${escapeHtml(t.subject)}</strong>
           ${badge(t.status)}
         </div>
-        <div class="meta">from ${t.requester} · ${t.created_at}</div>
-        <div class="body-text">${t.body}</div>
-        ${t.result_summary ? `<div class="body-text" style="color:var(--text)"><strong>Result:</strong> ${t.result_summary}</div>` : ""}
+        <div class="meta">from ${escapeHtml(t.requester)} · ${escapeHtml(t.created_at)}</div>
+        <div class="body-text">${escapeHtml(t.body)}</div>
+        ${t.result_summary ? `<div class="body-text" style="color:var(--text)"><strong>Result:</strong> ${escapeHtml(t.result_summary)}</div>` : ""}
         <button class="link-btn" onclick="toggleAudit(${t.id}, this)">Show audit log</button>
         <div id="audit-${t.id}" data-open="0"></div>
       </div>
