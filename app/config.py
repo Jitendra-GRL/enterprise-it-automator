@@ -20,11 +20,13 @@ class Settings(BaseSettings):
     watsonx_model: str = "ibm/granite-3-8b-instruct"
 
     database_url: str = "sqlite+aiosqlite:///./it_automator.db"
+    checkpoint_db_path: str = "./it_automator_checkpoints.db"
 
     sensitive_actions: str = "disable_user,revoke_access"
 
     api_host: str = "0.0.0.0"
     api_port: int = 8000
+    api_key: str = ""
 
     @property
     def sensitive_action_set(self) -> set[str]:
