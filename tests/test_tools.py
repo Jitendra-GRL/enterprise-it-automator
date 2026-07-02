@@ -52,6 +52,19 @@ async def test_disable_user_not_found(session):
         await t.disable_user(session, "ghost")
 
 
+async def test_disable_user_already_disabled_rejected(session):
+    await t.create_user(session, "ckent", "Clark Kent", "c@example.com")
+    await t.disable_user(session, "ckent")
+    with pytest.raises(ToolError, match="already disabled"):
+        await t.disable_user(session, "ckent")
+
+
+async def test_revoke_access_not_granted_rejected(session):
+    await t.create_user(session, "bwayne", "Bruce Wayne", "b@example.com")
+    with pytest.raises(ToolError, match="does not have access"):
+        await t.revoke_access(session, "bwayne", "github:engineering")
+
+
 async def test_is_sensitive():
     assert t.is_sensitive("disable_user") is True
     assert t.is_sensitive("revoke_access") is True
