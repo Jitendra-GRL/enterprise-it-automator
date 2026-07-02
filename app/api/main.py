@@ -2,11 +2,12 @@ import logging
 from contextlib import asynccontextmanager
 from pathlib import Path
 
-from fastapi import FastAPI, HTTPException
+from fastapi import Depends, FastAPI, HTTPException
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 
 from app.agent.runner import resume_ticket_run, start_ticket_run
+from app.api.auth import require_api_key
 from app.api.schemas import (
     ApprovalDecision,
     ApprovalOut,
@@ -15,16 +16,27 @@ from app.api.schemas import (
     TicketCreate,
     TicketOut,
 )
+from app.config import get_settings
 from app.db.models import Approval, ApprovalStatus, AuditLog, Ticket, TicketStatus
 from app.db.session import init_db, session_scope
 
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
+    if not get_settings().api_key:
+        logger.warning(
+            "API_KEY is not set — /tickets, /approvals, and /audit endpoints are "
+            "UNAUTHENTICATED. Set API_KEY in .env before exposing this beyond localhost."
+        )
     await init_db()
     yield
+    from app.agent import runner
+
+    if runner._checkpointer_cm is not None:
+        await runner._checkpointer_cm.__aexit__(None, None, None)
 
 
 app = FastAPI(
@@ -50,7 +62,7 @@ async def ui() -> FileResponse:
     return FileResponse(STATIC_DIR / "index.html")
 
 
-@app.post("/tickets", response_model=RunResult)
+@app.post("/tickets", response_model=RunResult, dependencies=[Depends(require_api_key)])
 async def submit_ticket(payload: TicketCreate) -> RunResult:
     """Creates a ticket and immediately runs the agent on it up to the first
     HITL interrupt (or completion, if no sensitive actions are needed)."""
@@ -70,14 +82,16 @@ async def submit_ticket(payload: TicketCreate) -> RunResult:
     return RunResult(**result)
 
 
-@app.get("/tickets", response_model=list[TicketOut])
+@app.get("/tickets", response_model=list[TicketOut], dependencies=[Depends(require_api_key)])
 async def list_tickets() -> list[Ticket]:
     async with session_scope() as session:
         rows = await session.scalars(select(Ticket).order_by(Ticket.created_at.desc()))
         return list(rows)
 
 
-@app.get("/tickets/{ticket_id}", response_model=TicketOut)
+@app.get(
+    "/tickets/{ticket_id}", response_model=TicketOut, dependencies=[Depends(require_api_key)]
+)
 async def get_ticket(ticket_id: int) -> Ticket:
     async with session_scope() as session:
         ticket = await session.get(Ticket, ticket_id)
@@ -86,7 +100,9 @@ async def get_ticket(ticket_id: int) -> Ticket:
         return ticket
 
 
-@app.get("/approvals", response_model=list[ApprovalOut])
+@app.get(
+    "/approvals", response_model=list[ApprovalOut], dependencies=[Depends(require_api_key)]
+)
 async def list_approvals(status: str | None = None) -> list[Approval]:
     async with session_scope() as session:
         query = select(Approval).order_by(Approval.created_at.desc())
@@ -99,7 +115,11 @@ async def list_approvals(status: str | None = None) -> list[Approval]:
         return list(rows)
 
 
-@app.post("/approvals/{approval_id}/decide", response_model=RunResult)
+@app.post(
+    "/approvals/{approval_id}/decide",
+    response_model=RunResult,
+    dependencies=[Depends(require_api_key)],
+)
 async def decide_approval(approval_id: int, payload: ApprovalDecision) -> RunResult:
     """Human reviewer approves or rejects a pending sensitive action, then the
     agent graph is resumed from exactly where it paused."""
@@ -135,7 +155,11 @@ async def decide_approval(approval_id: int, payload: ApprovalDecision) -> RunRes
     return RunResult(**result)
 
 
-@app.get("/tickets/{ticket_id}/audit", response_model=list[AuditLogOut])
+@app.get(
+    "/tickets/{ticket_id}/audit",
+    response_model=list[AuditLogOut],
+    dependencies=[Depends(require_api_key)],
+)
 async def get_ticket_audit(ticket_id: int) -> list[AuditLog]:
     async with session_scope() as session:
         rows = await session.scalars(
