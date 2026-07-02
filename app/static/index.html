@@ -1,0 +1,256 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<title>MCP IT Automator</title>
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<style>
+  :root {
+    --bg: #0f1115; --panel: #161923; --border: #262b3a; --text: #e6e8ee;
+    --muted: #8a90a3; --accent: #5b8cff; --ok: #35c98f; --warn: #f5a623; --err: #f0546a;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; font-family: -apple-system, Segoe UI, Roboto, sans-serif;
+    background: var(--bg); color: var(--text); font-size: 14px;
+  }
+  header { padding: 16px 24px; border-bottom: 1px solid var(--border); }
+  header h1 { margin: 0; font-size: 18px; }
+  header p { margin: 4px 0 0; color: var(--muted); font-size: 12px; }
+  main { display: grid; grid-template-columns: 380px 1fr; gap: 20px; padding: 20px 24px; max-width: 1400px; margin: 0 auto; }
+  section.panel {
+    background: var(--panel); border: 1px solid var(--border); border-radius: 8px; padding: 16px;
+  }
+  section.panel h2 { margin: 0 0 12px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: .05em; }
+  label { display: block; margin-bottom: 4px; color: var(--muted); font-size: 12px; }
+  input, textarea {
+    width: 100%; background: #0b0d13; border: 1px solid var(--border); border-radius: 6px;
+    color: var(--text); padding: 8px 10px; font-family: inherit; font-size: 13px; margin-bottom: 12px;
+  }
+  textarea { min-height: 90px; resize: vertical; }
+  button {
+    background: var(--accent); color: white; border: none; border-radius: 6px;
+    padding: 8px 14px; font-size: 13px; cursor: pointer; font-weight: 600;
+  }
+  button:hover { opacity: .9; }
+  button.secondary { background: #2a3040; }
+  button.approve { background: var(--ok); }
+  button.reject { background: var(--err); }
+  button:disabled { opacity: .4; cursor: not-allowed; }
+  .row { display: flex; gap: 8px; }
+  .card {
+    border: 1px solid var(--border); border-radius: 6px; padding: 10px 12px; margin-bottom: 10px;
+    background: #0f1219;
+  }
+  .card-head { display: flex; justify-content: space-between; align-items: center; gap: 8px; }
+  .card-head strong { font-size: 13px; }
+  .badge {
+    font-size: 10px; padding: 2px 8px; border-radius: 999px; text-transform: uppercase;
+    letter-spacing: .04em; font-weight: 700;
+  }
+  .badge.received, .badge.planning { background: #2a3040; color: var(--muted); }
+  .badge.awaiting_approval { background: rgba(245,166,35,.15); color: var(--warn); }
+  .badge.executing { background: rgba(91,140,255,.15); color: var(--accent); }
+  .badge.completed { background: rgba(53,201,143,.15); color: var(--ok); }
+  .badge.rejected, .badge.failed { background: rgba(240,84,106,.15); color: var(--err); }
+  .badge.pending { background: rgba(245,166,35,.15); color: var(--warn); }
+  .badge.approved { background: rgba(53,201,143,.15); color: var(--ok); }
+  .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
+  .body-text { color: var(--muted); font-size: 12px; margin-top: 6px; white-space: pre-wrap; }
+  .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
+  .toolbar { display: flex; justify-content: space-between; align-items: center; margin-bottom: 12px; }
+  .toolbar h2 { margin: 0; }
+  code.tool { background: #1c2130; color: var(--accent); padding: 1px 6px; border-radius: 4px; font-size: 11px; }
+  #toast {
+    position: fixed; bottom: 20px; right: 20px; background: var(--panel); border: 1px solid var(--border);
+    padding: 10px 16px; border-radius: 6px; font-size: 13px; display: none; max-width: 360px;
+  }
+  #toast.err { border-color: var(--err); color: var(--err); }
+  .audit-detail { margin-top: 8px; padding-top: 8px; border-top: 1px solid var(--border); }
+  .audit-row { font-size: 11px; color: var(--muted); margin-bottom: 4px; }
+  .link-btn { background: none; color: var(--accent); padding: 0; font-weight: 400; text-decoration: underline; font-size: 11px; }
+</style>
+</head>
+<body>
+
+<header>
+  <h1>MCP Enterprise IT Automator</h1>
+  <p>Submit a ticket → agent plans via MCP tools → sensitive actions pause for human approval</p>
+</header>
+
+<main>
+  <section class="panel">
+    <h2>New Ticket</h2>
+    <label for="requester">Requester</label>
+    <input id="requester" value="hr@example.com" />
+    <label for="subject">Subject</label>
+    <input id="subject" value="Offboard employee" />
+    <label for="body">Body</label>
+    <textarea id="body">Offboard jsmith - disable her account, she left the company.</textarea>
+    <button id="submitBtn" onclick="submitTicket()">Submit Ticket</button>
+  </section>
+
+  <div style="display:flex; flex-direction:column; gap:20px;">
+    <section class="panel">
+      <div class="toolbar">
+        <h2 style="margin:0">Pending Approvals</h2>
+        <button class="secondary" onclick="refreshAll()">Refresh</button>
+      </div>
+      <div id="approvals"><p class="empty">Loading…</p></div>
+    </section>
+
+    <section class="panel">
+      <h2>Tickets</h2>
+      <div id="tickets"><p class="empty">Loading…</p></div>
+    </section>
+  </div>
+</main>
+
+<div id="toast"></div>
+
+<script>
+const API = "";
+
+function toast(msg, isErr) {
+  const el = document.getElementById("toast");
+  el.textContent = msg;
+  el.className = isErr ? "err" : "";
+  el.style.display = "block";
+  clearTimeout(el._t);
+  el._t = setTimeout(() => el.style.display = "none", 4000);
+}
+
+async function api(path, opts) {
+  const res = await fetch(API + path, Object.assign({
+    headers: { "Content-Type": "application/json" }
+  }, opts || {}));
+  const data = await res.json().catch(() => ({}));
+  if (!res.ok) {
+    const msg = data.detail ? JSON.stringify(data.detail) : res.statusText;
+    throw new Error(msg);
+  }
+  return data;
+}
+
+async function submitTicket() {
+  const btn = document.getElementById("submitBtn");
+  btn.disabled = true;
+  try {
+    const payload = {
+      requester: document.getElementById("requester").value,
+      subject: document.getElementById("subject").value,
+      body: document.getElementById("body").value,
+    };
+    const result = await api("/tickets", { method: "POST", body: JSON.stringify(payload) });
+    toast(result.interrupted
+      ? `Ticket #${result.ticket_id} paused for approval (${result.pending_approval.tool})`
+      : `Ticket #${result.ticket_id} finished: ${result.done ? "done" : "in progress"}`);
+    await refreshAll();
+  } catch (e) {
+    toast("Failed to submit ticket: " + e.message, true);
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+async function decide(approvalId, approve) {
+  try {
+    const result = await api(`/approvals/${approvalId}/decide`, {
+      method: "POST",
+      body: JSON.stringify({ reviewer: "ui-operator@example.com", approve }),
+    });
+    toast(approve
+      ? (result.interrupted ? `Approved — next action (${result.pending_approval.tool}) now pending` : `Approved — ticket #${result.ticket_id} complete`)
+      : `Rejected — ticket #${result.ticket_id} closed`);
+    await refreshAll();
+  } catch (e) {
+    toast("Failed to record decision: " + e.message, true);
+  }
+}
+
+function badge(status) {
+  return `<span class="badge ${status}">${status.replace(/_/g, " ")}</span>`;
+}
+
+async function renderApprovals() {
+  const el = document.getElementById("approvals");
+  try {
+    const approvals = await api("/approvals?status=pending");
+    if (!approvals.length) {
+      el.innerHTML = `<p class="empty">No pending approvals.</p>`;
+      return;
+    }
+    el.innerHTML = approvals.map(a => `
+      <div class="card">
+        <div class="card-head">
+          <strong>#${a.id} · <code class="tool">${a.tool_name}</code></strong>
+          ${badge(a.status)}
+        </div>
+        <div class="meta">Ticket #${a.ticket_id} · args: ${JSON.stringify(a.tool_args)}</div>
+        <div class="body-text">${a.reasoning || ""}</div>
+        <div class="row" style="margin-top:8px">
+          <button class="approve" onclick="decide(${a.id}, true)">Approve</button>
+          <button class="reject" onclick="decide(${a.id}, false)">Reject</button>
+        </div>
+      </div>
+    `).join("");
+  } catch (e) {
+    el.innerHTML = `<p class="empty">Failed to load approvals: ${e.message}</p>`;
+  }
+}
+
+async function toggleAudit(ticketId, btn) {
+  const target = document.getElementById(`audit-${ticketId}`);
+  if (target.dataset.open === "1") {
+    target.innerHTML = "";
+    target.dataset.open = "0";
+    btn.textContent = "Show audit log";
+    return;
+  }
+  btn.textContent = "Hide audit log";
+  target.dataset.open = "1";
+  try {
+    const rows = await api(`/tickets/${ticketId}/audit`);
+    target.innerHTML = rows.length
+      ? rows.map(r => `<div class="audit-row">${r.created_at} · <code class="tool">${r.tool_name}</code> · ${r.success ? "ok" : "FAILED"} · ${r.result}</div>`).join("")
+      : `<p class="empty">No audit entries yet.</p>`;
+  } catch (e) {
+    target.innerHTML = `<p class="empty">Failed to load audit log: ${e.message}</p>`;
+  }
+}
+
+async function renderTickets() {
+  const el = document.getElementById("tickets");
+  try {
+    const tickets = await api("/tickets");
+    if (!tickets.length) {
+      el.innerHTML = `<p class="empty">No tickets yet — submit one on the left.</p>`;
+      return;
+    }
+    el.innerHTML = tickets.map(t => `
+      <div class="card">
+        <div class="card-head">
+          <strong>#${t.id} · ${t.subject}</strong>
+          ${badge(t.status)}
+        </div>
+        <div class="meta">from ${t.requester} · ${t.created_at}</div>
+        <div class="body-text">${t.body}</div>
+        ${t.result_summary ? `<div class="body-text" style="color:var(--text)"><strong>Result:</strong> ${t.result_summary}</div>` : ""}
+        <button class="link-btn" onclick="toggleAudit(${t.id}, this)">Show audit log</button>
+        <div id="audit-${t.id}" data-open="0"></div>
+      </div>
+    `).join("");
+  } catch (e) {
+    el.innerHTML = `<p class="empty">Failed to load tickets: ${e.message}</p>`;
+  }
+}
+
+async function refreshAll() {
+  await Promise.all([renderApprovals(), renderTickets()]);
+}
+
+refreshAll();
+setInterval(refreshAll, 8000);
+</script>
+</body>
+</html>
