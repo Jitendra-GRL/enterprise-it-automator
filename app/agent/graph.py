@@ -1,33 +1,109 @@
-"""LangGraph agent: ticket -> ReAct-style plan -> MCP tool execution -> HITL gate.
+"""LangGraph agent: ticket -> classify -> ReAct-style plan -> MCP tool execution -> HITL gate.
 
-Graph shape (a small DAG, not a linear chain):
+Graph shape:
 
-    plan -> route -> execute_step -> route -> ... -> finalize
-                 \\-> await_approval (interrupt) -/
+    classify -> plan -> route -> execute_step -> route -> ... -> finalize
+                            |-> await_approval (interrupt) -/
+                            \\-> execute_batch_step (fan-out, N parallel) -> join_batch -/
 
-`route` inspects the next planned action: sensitive actions with no approved
-gate yet fall through to `await_approval`, which uses LangGraph's `interrupt()`
-to pause the graph entirely until a human resolves the Approval row via the
-FastAPI layer. Non-sensitive actions (or already-approved ones) go straight to
-`execute_step`, which calls the MCP server as a real MCP client over stdio.
+`classify_node` runs a lightweight classifier before planning: is this ticket
+about ONBOARDING (new hire), OFFBOARDING (departing employee), or an
+ACCESS_CHANGE (grant/revoke for someone already employed)? `plan_node` then
+uses the category-specialized system prompt for that ticket type (see
+app/agent/prompts/) instead of one generic prompt trying to cover all three
+— a supervisor/router pattern: the classifier is the "supervisor" deciding
+which specialized "sub-agent" prompt handles the ticket, though it's
+implemented as one graph with a prompt-selection branch rather than
+literally separate compiled sub-graphs, since the downstream execution
+machinery (fan-out, replanning, HITL, retries) is identical regardless of
+category and duplicating it three times would just be repetition without a
+real behavioral difference.
+
+`route` inspects the plan starting at plan_index:
+- A single sensitive step falls through to `await_approval`, which uses
+  LangGraph's `interrupt()` to pause the graph entirely until a human
+  resolves the Approval row via the FastAPI layer.
+- A single non-sensitive step goes to `execute_step` (sequential path,
+  unchanged from before fan-out was added).
+- A CONSECUTIVE RUN of two or more non-sensitive steps fans out via
+  langgraph.types.Send — one execute_batch_step invocation per step,
+  running concurrently — then converges at join_batch, which advances
+  plan_index past the whole batch at once and re-routes.
+
+After each step (or batch) executes, route_after_execution checks whether
+the result looks like it was based on a stale plan assumption (e.g. "user
+already exists", "resource already granted") — if so, replan_node re-invokes
+the planner with a summary of what's happened so far, bounded by
+MAX_REPLANS to avoid a runaway loop if the planner keeps proposing
+conflicting steps.
+
+Every LLM call and MCP tool call is wrapped with node-level RetryPolicy
+(transient-only backoff/retry) and OpenTelemetry span instrumentation
+(app/observability.py) — traced at graph.add_node() registration time in
+build_graph(), not at function-definition time, so tests that monkeypatch
+the module-level node functions directly keep working unchanged.
 """
 
 import json
 import logging
+import re
+from typing import Literal
 
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
-from langgraph.types import interrupt
+from langgraph.types import RetryPolicy, Send, interrupt
 
 from app.agent.llm import get_llm
-from app.agent.mcp_client import call_tool, mcp_session
-from app.agent.state import AgentState
+from app.agent.mcp_client import call_tool, is_transient_error, mcp_session
+from app.agent.mcp_session_cache import get_cached_proxy
+from app.agent.prompts.access_change import ACCESS_CHANGE_PLANNER_PROMPT
+from app.agent.prompts.offboarding import OFFBOARDING_PLANNER_PROMPT
+from app.agent.prompts.onboarding import ONBOARDING_PLANNER_PROMPT
+from app.agent.state import AgentState, BatchStepInput
 from app.config import get_settings
 from app.db.session import session_scope
 from app.mcp_server.approval_gate import find_approved
 from app.mcp_server.tools import is_sensitive
+from app.observability import record_llm_call, trace_graph_node
 
 logger = logging.getLogger(__name__)
+
+# Re-exported under the old name — this module's error-classification logic
+# now lives in mcp_client.py (shared with the circuit breaker), but keeping
+# this alias avoids a churn-only rename across every existing call site and
+# test in this file.
+_is_transient_error = is_transient_error
+
+
+async def _call_tool_for_ticket(ticket_id: int, tool: str, args: dict) -> str:
+    """Routes a tool call through the graph run's shared MCP session-owner
+    task if one is active (set up by runner.py's ticket_run_session()
+    around the graph.ainvoke() call), otherwise falls back to opening a
+    standalone one-off session — e.g. when a node is invoked directly in a
+    test, or from any future call path that doesn't go through runner.py's
+    session-caching wrapper.
+
+    Deliberately NOT a context manager yielding a raw ClientSession: MCP's
+    stdio transport ties its anyio task group to whichever task opens it,
+    so a session shared across LangGraph's per-node tasks must be owned and
+    accessed through a dedicated owner task + queue proxy (SessionProxy),
+    not handed out directly — see mcp_session_cache.py for why.
+    """
+    proxy = get_cached_proxy(ticket_id)
+    if proxy is not None:
+        return await proxy.call_tool(tool, args)
+    async with mcp_session() as session:
+        return await call_tool(session, tool, args)
+
+
+AGENT_RETRY_POLICY = RetryPolicy(
+    initial_interval=0.5,
+    backoff_factor=2.0,
+    max_interval=8.0,
+    max_attempts=4,
+    jitter=True,
+    retry_on=_is_transient_error,
+)
 
 USERNAME_EXTRACTION_PROMPT = """Extract the single employee username this IT ticket is \
 about. Prefer an explicit username mentioned in the ticket (e.g. "username jsmith" or \
@@ -36,47 +112,40 @@ initial + last name, no spaces). Respond with ONLY the username, no prose, no pu
 If no employee is identifiable, respond with exactly: NONE
 """
 
-PLANNER_SYSTEM_PROMPT = """You are an enterprise IT automation agent. You process \
-employee onboarding, offboarding, and access-change tickets by planning a sequence \
-of tool calls.
+CLASSIFY_PROMPT = """Classify this IT ticket into exactly one category:
+- ONBOARDING: bringing a new hire into the system (creating an account, initial access)
+- OFFBOARDING: disabling a departing employee's account
+- ACCESS_CHANGE: granting or revoking a specific resource for an employee who is \
+already onboarded and not being offboarded
 
-Available tools:
-- get_user(username) -> look up an employee record
-- create_user(username, full_name, email, department) -> onboard a new employee.
-  This AUTOMATICALLY grants a default access bundle for the employee's department
-  (e.g. Engineering gets vpn + github:engineering + jira:core-platform; Sales gets
-  vpn + salesforce; IT gets vpn + github:engineering + admin-panel). Do NOT plan a
-  separate grant_access call for anything already covered by the department default
-  — only plan grant_access for resources the ticket explicitly asks for that go
-  beyond the department default (e.g. a specific one-off tool or repo).
-- grant_access(username, resource) -> grant access to a resource (e.g. "github:engineering", "vpn", "jira:core-platform", "admin-panel")
-- disable_user(username) -> deactivate an employee's account (SENSITIVE)
-- revoke_access(username, resource) -> remove access to a resource (SENSITIVE)
-
-You will be told, as an OBSERVATION, whether the ticket's target employee already \
-exists in the system, their current status (active/disabled), and their current \
-access grants, before you plan. Use it:
-- If the ticket asks to onboard/enable/create an employee who the observation says \
-ALREADY EXISTS and is active, do NOT call create_user again — just grant_access for \
-whatever the ticket additionally requests (or return [] if nothing more is needed).
-- If the ticket asks to onboard/enable/create an employee who the observation says \
-DOES NOT EXIST, call create_user (and get_user is unnecessary — you already know it \
-doesn't exist).
-- If the ticket asks to offboard/disable/revoke access for an employee who DOES NOT \
-EXIST, return [] — there is nothing to act on.
-- If the ticket asks to disable/offboard an employee whose observation status is \
-already "disabled", do NOT call disable_user again — omit that step (and return [] \
-if there is nothing else to do).
-- If the ticket asks to revoke a resource the observation's access_grants does NOT \
-list for that employee, do NOT call revoke_access for it — there is nothing to revoke.
-- Never plan a get_user call as a standalone step; the existence check has already \
-been done for you via the observation.
-
-Read the ticket and respond with ONLY a JSON array of steps, no prose, no markdown \
-fences. Each step is an object: {"tool": "<tool_name>", "args": {...}, "reasoning": "<why>"}.
-Use the exact argument names shown above, and the exact username given in the observation. \
-If the ticket lacks enough information to act, return an empty array [].
+Respond with ONLY one of these three words, no prose, no punctuation: \
+ONBOARDING, OFFBOARDING, or ACCESS_CHANGE. If genuinely ambiguous, prefer ACCESS_CHANGE.
 """
+
+TicketCategory = Literal["ONBOARDING", "OFFBOARDING", "ACCESS_CHANGE"]
+
+CATEGORY_PROMPTS: dict[TicketCategory, str] = {
+    "ONBOARDING": ONBOARDING_PLANNER_PROMPT,
+    "OFFBOARDING": OFFBOARDING_PLANNER_PROMPT,
+    "ACCESS_CHANGE": ACCESS_CHANGE_PLANNER_PROMPT,
+}
+
+
+def _llm_model_name() -> str:
+    """Model identifier for the currently configured provider, purely for
+    tracing attribution (gen_ai.request.model) — reads straight from
+    Settings rather than introspecting the LangChain chat model object,
+    since each provider's wrapper exposes the model name under a different
+    attribute.
+    """
+    settings = get_settings()
+    provider = settings.llm_provider.lower()
+    return {
+        "groq": settings.groq_model,
+        "anthropic": settings.anthropic_model,
+        "watsonx": settings.watsonx_model,
+        "openrouter": settings.openrouter_model,
+    }.get(provider, provider)
 
 
 def _unwrap_exception(exc: BaseException) -> BaseException:
@@ -91,8 +160,34 @@ def _unwrap_exception(exc: BaseException) -> BaseException:
     return seen
 
 
+# Upper bound on how many steps a single plan (from plan_node OR
+# replan_node) may contain. Without this, a crafted/adversarial ticket body
+# could get the LLM to emit an arbitrarily large plan array — every step
+# becomes a real MCP tool call, DB write, and audit log row (and, for
+# non-sensitive runs, fans out via Send into concurrent execute_batch_step
+# invocations) — with only MAX_REPLANS bounding replan CYCLES, nothing
+# previously bounded plan SIZE. /tickets is rate-limited to 20/minute at
+# the HTTP layer, but that doesn't stop one request's plan from being huge.
+MAX_PLAN_LENGTH = 25
+
+# A real upstream HR/IdP system of record to validate usernames against is
+# explicitly out of scope (ROADMAP.md Stage 4.4 calls a full SCIM/OpenLDAP
+# identity sync a trap for a solo project). Short of that, this is the
+# right-sized guardrail: reject any username arg that doesn't look like a
+# plausible system username BEFORE a plan reaches execute_step/
+# execute_batch_step and a real create_user/disable_user/revoke_access
+# call — closes "the planner's username args have no validation beyond
+# the planner prompt's own (unenforced) instruction to reuse the
+# observation's username" without requiring a real identity backend. The
+# prompt tells the LLM to reuse the exact observed username, but nothing
+# server-side previously enforced that.
+_USERNAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$")
+
+
 def _extract_json_array(text: str) -> list[dict]:
-    """Best-effort structural parsing guardrail against markdown fences / stray prose."""
+    """Best-effort structural parsing guardrail against markdown fences /
+    stray prose, plus a hard cap on plan size (MAX_PLAN_LENGTH) and a
+    format check on every step's `username` arg (_USERNAME_PATTERN)."""
     text = text.strip()
     if text.startswith("```"):
         text = text.strip("`")
@@ -102,7 +197,20 @@ def _extract_json_array(text: str) -> list[dict]:
     end = text.rfind("]")
     if start == -1 or end == -1 or end < start:
         raise ValueError(f"Planner did not return a JSON array: {text[:200]!r}")
-    return json.loads(text[start : end + 1])
+    steps = json.loads(text[start : end + 1])
+    if len(steps) > MAX_PLAN_LENGTH:
+        raise ValueError(
+            f"Planner returned {len(steps)} steps, exceeding the {MAX_PLAN_LENGTH}-step "
+            "limit per plan — refusing to execute an unbounded plan."
+        )
+    for step in steps:
+        username = step.get("args", {}).get("username") if isinstance(step, dict) else None
+        if username is not None and not _USERNAME_PATTERN.match(str(username)):
+            raise ValueError(
+                f"Planner step targets username {username!r}, which doesn't look like a "
+                "valid username — refusing to execute a plan with a malformed target."
+            )
+    return steps
 
 
 async def _extract_username(llm, ticket_text: str) -> str | None:
@@ -112,6 +220,7 @@ async def _extract_username(llm, ticket_text: str) -> str | None:
             HumanMessage(content=f"Ticket:\n{ticket_text}"),
         ]
     )
+    record_llm_call("extract_username", _llm_model_name(), response)
     raw = response.content if isinstance(response.content, str) else str(response.content)
     stripped = raw.strip()
     if not stripped:
@@ -119,21 +228,63 @@ async def _extract_username(llm, ticket_text: str) -> str | None:
     username = stripped.strip('"').strip("'").splitlines()[0].strip()
     if not username or username.upper() == "NONE":
         return None
+    if not _USERNAME_PATTERN.match(username):
+        logger.warning("Extracted username %r doesn't look like a valid username — treating as unidentified", username)
+        return None
     return username
 
 
-async def _observe_user(username: str) -> str:
+async def _observe_user(username: str, ticket_id: int) -> str:
     """Real MCP tool call — the 'Act' + 'Observe' half of ReAct, run once up
     front so the planner reasons from ground truth instead of guessing
     whether the target account already exists.
+
+    Only a ToolError-shaped "no such user" response means the employee
+    genuinely doesn't exist. A transient failure (dropped connection,
+    subprocess crash) must NOT be reinterpreted as "doesn't exist" — that
+    would feed the planner a false negative — so it's re-raised for the
+    node-level RetryPolicy to retry instead.
     """
     try:
-        async with mcp_session() as session:
-            raw = await call_tool(session, "get_user", {"username": username})
+        raw = await _call_tool_for_ticket(ticket_id, "identity_get_user", {"username": username})
         return f"Employee {username!r} ALREADY EXISTS. Current record: {raw}"
     except Exception as exc:
         leaf = _unwrap_exception(exc)
+        if _is_transient_error(leaf):
+            raise leaf from exc
         return f"Employee {username!r} DOES NOT EXIST ({leaf})."
+
+
+async def classify_ticket_category(llm, ticket_text: str) -> TicketCategory:
+    """Supervisor step: decides which specialized planner prompt handles
+    this ticket. A malformed/unexpected classifier response defaults to
+    ACCESS_CHANGE — the least destructive category (no account
+    creation/disabling), so an ambiguous ticket doesn't silently get routed
+    to onboarding or offboarding logic it wasn't meant for.
+    """
+    response = await llm.ainvoke(
+        [
+            SystemMessage(content=CLASSIFY_PROMPT),
+            HumanMessage(content=f"Ticket:\n{ticket_text}"),
+        ]
+    )
+    record_llm_call("classify", _llm_model_name(), response)
+    raw = response.content if isinstance(response.content, str) else str(response.content)
+    normalized = raw.strip().upper().strip('"').strip("'")
+    if normalized in CATEGORY_PROMPTS:
+        return normalized  # type: ignore[return-value]
+    logger.warning("Classifier produced unexpected category %r, defaulting to ACCESS_CHANGE", raw)
+    return "ACCESS_CHANGE"
+
+
+async def classify_node(state: AgentState) -> dict:
+    llm = get_llm()
+    category = await classify_ticket_category(llm, state["ticket_text"])
+    return {"category": category}
+
+
+def route_after_classify(state: AgentState) -> str:
+    return "plan"
 
 
 async def plan_node(state: AgentState) -> dict:
@@ -141,19 +292,23 @@ async def plan_node(state: AgentState) -> dict:
 
     username = await _extract_username(llm, state["ticket_text"])
     observation = (
-        await _observe_user(username)
+        await _observe_user(username, state["ticket_id"])
         if username
         else "No specific employee username could be identified from the ticket."
     )
 
+    category = state.get("category", "ACCESS_CHANGE")
+    system_prompt = CATEGORY_PROMPTS.get(category, CATEGORY_PROMPTS["ACCESS_CHANGE"])
+
     response = await llm.ainvoke(
         [
-            SystemMessage(content=PLANNER_SYSTEM_PROMPT),
+            SystemMessage(content=system_prompt),
             HumanMessage(
                 content=f"Ticket:\n{state['ticket_text']}\n\nOBSERVATION: {observation}"
             ),
         ]
     )
+    record_llm_call("plan", _llm_model_name(), response)
     raw = response.content if isinstance(response.content, str) else str(response.content)
 
     try:
@@ -185,7 +340,19 @@ def route_step(state: AgentState) -> dict:
     return {}
 
 
-def route_after_step_check(state: AgentState) -> str:
+def _batchable_run_length(plan: list, start: int) -> int:
+    """How many consecutive non-sensitive steps starting at `start` can run
+    as one concurrent batch. Stops at the first sensitive step (which must
+    go through await_approval, not be silently batched past) or the end of
+    the plan.
+    """
+    idx = start
+    while idx < len(plan) and not is_sensitive(plan[idx]["tool"]):
+        idx += 1
+    return idx - start
+
+
+def route_after_step_check(state: AgentState):
     plan = state["plan"]
     idx = state["plan_index"]
     if idx >= len(plan):
@@ -194,6 +361,21 @@ def route_after_step_check(state: AgentState) -> str:
     step = plan[idx]
     if is_sensitive(step["tool"]):
         return "await_approval"
+
+    run_length = _batchable_run_length(plan, idx)
+    if run_length >= 2:
+        return [
+            Send(
+                "execute_batch_step",
+                BatchStepInput(
+                    ticket_id=state["ticket_id"],
+                    tool=plan[i]["tool"],
+                    args=plan[i]["args"],
+                    reasoning=plan[i].get("reasoning", ""),
+                ),
+            )
+            for i in range(idx, idx + run_length)
+        ]
     return "execute_step"
 
 
@@ -214,16 +396,20 @@ async def await_approval_node(state: AgentState) -> dict:
     if approval is not None:
         return {"pending_approval_id": approval.id}
 
+    import datetime as dt
+
     from app.db.models import Approval, ApprovalStatus, Ticket, TicketStatus
 
     async with session_scope() as session:
         existing_pending = await session.get(Ticket, ticket_id)
+        sla_minutes = get_settings().approval_sla_minutes
         approval_row = Approval(
             ticket_id=ticket_id,
             tool_name=step["tool"],
             tool_args=step["args"],
             reasoning=step.get("reasoning", ""),
             status=ApprovalStatus.PENDING,
+            sla_deadline=dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=sla_minutes),
         )
         session.add(approval_row)
         if existing_pending is not None:
@@ -251,25 +437,149 @@ def route_after_approval(state: AgentState) -> str:
 async def execute_step_node(state: AgentState) -> dict:
     step = state["plan"][state["plan_index"]]
     args = dict(step["args"])
-    args["ticket_id"] = state["ticket_id"]
 
     if is_sensitive(step["tool"]) and state.get("pending_approval_id"):
         args["approval_id"] = state["pending_approval_id"]
 
-    results = list(state.get("results", []))
     try:
-        async with mcp_session() as session:
-            raw_result = await call_tool(session, step["tool"], args)
-        results.append({"tool": step["tool"], "args": step["args"], "result": raw_result, "ok": True})
+        raw_result = await _call_tool_for_ticket(state["ticket_id"], step["tool"], args)
+        result = {"tool": step["tool"], "args": step["args"], "result": raw_result, "ok": True}
     except Exception as exc:
         leaf = _unwrap_exception(exc)
+        if _is_transient_error(leaf):
+            # Re-raise so the node-level RetryPolicy (registered in
+            # build_graph()) actually retries — swallowing it here into an
+            # ok:False result would make Stage 1.1's retry/backoff a no-op,
+            # since LangGraph only retries on an exception escaping the node.
+            raise leaf from exc
         logger.warning("Tool execution failed for %s: %s", step["tool"], leaf)
-        results.append({"tool": step["tool"], "args": step["args"], "result": str(leaf), "ok": False})
+        result = {"tool": step["tool"], "args": step["args"], "result": str(leaf), "ok": False}
 
     return {
-        "results": results,
+        "results": [result],
         "plan_index": state["plan_index"] + 1,
         "pending_approval_id": None,
+    }
+
+
+async def execute_batch_step_node(payload: BatchStepInput) -> dict:
+    """Fan-out target for a concurrent batch of non-sensitive steps — each
+    Send() invocation runs this independently (LangGraph schedules them as
+    separate tasks), so this must route its tool call the same
+    session-cache-aware way execute_step_node does; a naive direct
+    mcp_session() per branch would defeat the whole point of session reuse
+    for a batch.
+    """
+    args = dict(payload["args"])
+    try:
+        raw_result = await _call_tool_for_ticket(payload["ticket_id"], payload["tool"], args)
+        result = {"tool": payload["tool"], "args": payload["args"], "result": raw_result, "ok": True}
+    except Exception as exc:
+        leaf = _unwrap_exception(exc)
+        if _is_transient_error(leaf):
+            raise leaf from exc
+        logger.warning("Batched tool execution failed for %s: %s", payload["tool"], leaf)
+        result = {"tool": payload["tool"], "args": payload["args"], "result": str(leaf), "ok": False}
+
+    return {"results": [result]}
+
+
+def join_batch_node(state: AgentState) -> dict:
+    """Convergence point for every Send("execute_batch_step", ...) branch —
+    LangGraph waits for all pending Sends to a given node before running it,
+    so by the time this runs, state["results"] already has every batched
+    step's result merged in via the operator.add reducer. Only job left:
+    advance plan_index past the whole batch at once.
+    """
+    plan = state["plan"]
+    idx = state["plan_index"]
+    run_length = _batchable_run_length(plan, idx)
+    return {"plan_index": idx + run_length}
+
+
+STALE_PLAN_ERROR_MARKERS = (
+    "already exists",
+    "already disabled",
+    "no such user",
+    "not granted",
+    "does not exist",
+)
+
+MAX_REPLANS = 2
+
+
+def _looks_like_stale_plan_error(result_text: str) -> bool:
+    lowered = result_text.lower()
+    return any(marker in lowered for marker in STALE_PLAN_ERROR_MARKERS)
+
+
+def route_after_execution(state: AgentState) -> str:
+    results = state.get("results", [])
+    if not results:
+        return "continue"
+
+    last = results[-1]
+    if not last["ok"] and _looks_like_stale_plan_error(last["result"]):
+        if state.get("replan_count", 0) < MAX_REPLANS:
+            return "replan"
+    return "continue"
+
+
+async def replan_node(state: AgentState) -> dict:
+    """Re-invokes the planner with the ticket text plus a summary of what's
+    already happened (successes and the failure that triggered replanning),
+    so the new plan accounts for actions already taken instead of redoing
+    or re-conflicting with them. Replaces the remaining plan starting at the
+    current position; already-executed steps and their results are kept.
+    """
+    llm = get_llm()
+    results = state.get("results", [])
+    progress_lines = [
+        f"- {r['tool']}({r['args']}) -> {'OK: ' + r['result'] if r['ok'] else 'FAILED: ' + r['result']}"
+        for r in results
+    ]
+    progress_summary = "\n".join(progress_lines) if progress_lines else "(no steps executed yet)"
+
+    replan_prompt = (
+        f"Ticket:\n{state['ticket_text']}\n\n"
+        f"You previously planned actions for this ticket. Here is what has "
+        f"actually happened so far (some may have failed because the plan's "
+        f"assumptions were stale by execution time):\n{progress_summary}\n\n"
+        f"Plan ONLY the remaining steps still needed, accounting for what "
+        f"already happened above — do not repeat a step that already "
+        f"succeeded, and do not repeat a step that failed for the same "
+        f"reason (e.g. if disable_user failed because the user was already "
+        f"disabled, that goal is already satisfied — do not replan it)."
+    )
+
+    category = state.get("category", "ACCESS_CHANGE")
+    system_prompt = CATEGORY_PROMPTS.get(category, CATEGORY_PROMPTS["ACCESS_CHANGE"])
+
+    response = await llm.ainvoke(
+        [
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=replan_prompt),
+        ]
+    )
+    record_llm_call("replan", _llm_model_name(), response)
+    raw = response.content if isinstance(response.content, str) else str(response.content)
+
+    try:
+        new_remaining_steps = _extract_json_array(raw)
+    except (ValueError, json.JSONDecodeError) as exc:
+        logger.warning("Replanner produced unparseable output: %s", exc)
+        return {
+            "error": f"Replanner returned malformed JSON: {exc}",
+            "done": True,
+            "messages": [AIMessage(content=raw)],
+        }
+
+    already_executed = state["plan"][: state["plan_index"]]
+    return {
+        "plan": already_executed + new_remaining_steps,
+        "plan_index": state["plan_index"],
+        "replan_count": state.get("replan_count", 0) + 1,
+        "messages": [AIMessage(content=raw)],
     }
 
 
@@ -286,17 +596,19 @@ def _describe_result(tool: str, args: dict, raw_result: str) -> str:
     username = (parsed or {}).get("username") if isinstance(parsed, dict) else None
     username = username or args.get("username", "")
 
-    if tool == "create_user":
+    bare_tool = tool.split("_", 1)[1] if "_" in tool and tool.split("_", 1)[0] in ("identity", "access") else tool
+
+    if bare_tool == "create_user":
         grants = (parsed or {}).get("access_grants") or []
         access_note = f" with access to {', '.join(grants)}" if grants else ""
         return f"Created account for {username}{access_note}."
-    if tool == "disable_user":
+    if bare_tool == "disable_user":
         return f"Disabled account for {username}."
-    if tool == "grant_access":
+    if bare_tool == "grant_access":
         return f"Granted {args.get('resource', '?')} access to {username}."
-    if tool == "revoke_access":
+    if bare_tool == "revoke_access":
         return f"Revoked {args.get('resource', '?')} access from {username}."
-    if tool == "get_user":
+    if bare_tool == "get_user":
         return f"Looked up {username}."
     return f"{tool} completed for {username}." if username else f"{tool} completed."
 
@@ -335,25 +647,55 @@ async def finalize_node(state: AgentState) -> dict:
 def build_graph():
     graph = StateGraph(AgentState)
 
-    graph.add_node("plan", plan_node)
+    # Node functions are wrapped with trace_graph_node at registration time
+    # (not at definition time) so tests that monkeypatch the module-level
+    # names (e.g. monkeypatch.setattr(graph_module, "plan_node", ...)) keep
+    # working unchanged — build_graph() picks up whatever the name currently
+    # points to, patched or original, and traces that.
+    graph.add_node("classify", trace_graph_node("classify")(classify_node), retry_policy=AGENT_RETRY_POLICY)
+    graph.add_node("plan", trace_graph_node("plan")(plan_node), retry_policy=AGENT_RETRY_POLICY)
     graph.add_node("route_step", route_step)
-    graph.add_node("await_approval", await_approval_node)
-    graph.add_node("execute_step", execute_step_node)
-    graph.add_node("finalize", finalize_node)
+    graph.add_node("await_approval", trace_graph_node("await_approval")(await_approval_node))
+    graph.add_node(
+        "execute_step", trace_graph_node("execute_step")(execute_step_node), retry_policy=AGENT_RETRY_POLICY
+    )
+    graph.add_node(
+        "execute_batch_step",
+        trace_graph_node("execute_batch_step")(execute_batch_step_node),
+        retry_policy=AGENT_RETRY_POLICY,
+    )
+    graph.add_node("join_batch", trace_graph_node("join_batch")(join_batch_node))
+    graph.add_node("replan", trace_graph_node("replan")(replan_node), retry_policy=AGENT_RETRY_POLICY)
+    graph.add_node("finalize", trace_graph_node("finalize")(finalize_node))
 
-    graph.set_entry_point("plan")
+    step_check_map = {
+        "await_approval": "await_approval",
+        "execute_step": "execute_step",
+        "execute_batch_step": "execute_batch_step",
+        "finalize": "finalize",
+    }
+
+    graph.set_entry_point("classify")
+    graph.add_conditional_edges("classify", route_after_classify, {"plan": "plan"})
     graph.add_conditional_edges("plan", route_after_plan, {"route_step": "route_step", "finalize": "finalize"})
-    graph.add_conditional_edges(
-        "route_step",
-        route_after_step_check,
-        {"await_approval": "await_approval", "execute_step": "execute_step", "finalize": "finalize"},
-    )
+    graph.add_conditional_edges("route_step", route_after_step_check, step_check_map)
     graph.add_conditional_edges("await_approval", route_after_approval, {"execute_step": "execute_step"})
+
+    # After a step (or a batch) executes, check whether its result looks
+    # like a stale-plan assumption before deciding what to do next — a
+    # detour through replan_node, or straight on to the normal step-check
+    # dispatch, exactly as before fan-out/replanning existed.
     graph.add_conditional_edges(
-        "execute_step",
-        route_after_step_check,
-        {"await_approval": "await_approval", "execute_step": "execute_step", "finalize": "finalize"},
+        "execute_step", route_after_execution, {"continue": "route_step", "replan": "replan"}
     )
+    # Every Send("execute_batch_step", ...) branch converges here; LangGraph
+    # waits for all pending Send targets before running a node they all
+    # point to, so join_batch only fires once the whole batch has finished.
+    graph.add_edge("execute_batch_step", "join_batch")
+    graph.add_conditional_edges(
+        "join_batch", route_after_execution, {"continue": "route_step", "replan": "replan"}
+    )
+    graph.add_conditional_edges("replan", route_after_step_check, step_check_map)
     graph.add_edge("finalize", END)
 
     return graph
