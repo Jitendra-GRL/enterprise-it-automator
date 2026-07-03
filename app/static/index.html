@@ -56,6 +56,7 @@
   .badge.rejected, .badge.failed { background: rgba(240,84,106,.15); color: var(--err); }
   .badge.pending { background: rgba(245,166,35,.15); color: var(--warn); }
   .badge.approved { background: rgba(53,201,143,.15); color: var(--ok); }
+  .badge.escalated { background: rgba(240,84,106,.15); color: var(--err); }
   .meta { color: var(--muted); font-size: 11px; margin-top: 4px; }
   .body-text { color: var(--muted); font-size: 12px; margin-top: 6px; white-space: pre-wrap; }
   .empty { color: var(--muted); font-size: 12px; padding: 8px 0; }
@@ -80,9 +81,15 @@
       <h1>MCP Enterprise IT Automator</h1>
       <p>Submit a ticket → agent plans via MCP tools → sensitive actions pause for human approval</p>
     </div>
-    <div style="min-width:220px;">
-      <label for="apiKeyInput" style="margin-bottom:4px;">API Key</label>
-      <input id="apiKeyInput" type="password" placeholder="leave blank if none configured" style="margin-bottom:0;" />
+    <div style="display:flex; gap:12px; flex-wrap:wrap;">
+      <div style="min-width:220px;">
+        <label for="apiKeyInput" style="margin-bottom:4px;">API Key</label>
+        <input id="apiKeyInput" type="password" placeholder="leave blank if none configured" style="margin-bottom:0;" />
+      </div>
+      <div style="min-width:180px;">
+        <label for="reviewerInput" style="margin-bottom:4px;">Reviewer token</label>
+        <input id="reviewerInput" type="password" placeholder="from `python -m app.db.seed` output" style="margin-bottom:0;" />
+      </div>
     </div>
   </div>
 </header>
@@ -160,13 +167,20 @@ apiKeyInput.addEventListener("input", () => {
   localStorage.setItem("apiKey", apiKeyInput.value);
 });
 
+const reviewerInput = document.getElementById("reviewerInput");
+reviewerInput.value = localStorage.getItem("reviewerToken") || "";
+reviewerInput.addEventListener("input", () => {
+  localStorage.setItem("reviewerToken", reviewerInput.value);
+});
+
 async function api(path, opts) {
-  const headers = { "Content-Type": "application/json" };
+  opts = opts || {};
+  const headers = Object.assign({ "Content-Type": "application/json" }, opts.headers || {});
   const key = apiKeyInput.value;
   if (key) headers["X-API-Key"] = key;
-  const res = await fetch(API + path, Object.assign({ headers }, opts || {}));
+  const res = await fetch(API + path, Object.assign({}, opts, { headers }));
   if (res.status === 401) {
-    toast("API key missing or invalid — set it in the top-right field.", true);
+    toast("API key or reviewer token missing/invalid — check the top-right fields.", true);
   }
   const data = await res.json().catch(() => ({}));
   if (!res.ok) {
@@ -198,10 +212,17 @@ async function submitTicket() {
 }
 
 async function decide(approvalId, approve) {
+  const reviewerToken = reviewerInput.value.trim();
+  if (!reviewerToken) {
+    toast("Enter your reviewer token (top right) before approving/rejecting — see `python -m app.db.seed` output.", true);
+    reviewerInput.focus();
+    return;
+  }
   try {
     const result = await api(`/approvals/${approvalId}/decide`, {
       method: "POST",
-      body: JSON.stringify({ reviewer: "ui-operator@example.com", approve }),
+      headers: { "X-Reviewer-Token": reviewerToken },
+      body: JSON.stringify({ approve }),
     });
     toast(approve
       ? (result.interrupted ? `Approved — next action (${result.pending_approval.tool}) now pending` : `Approved — ticket #${result.ticket_id} complete`)
@@ -213,7 +234,7 @@ async function decide(approvalId, approve) {
 }
 
 function badge(status) {
-  return `<span class="badge ${status}">${status.replace(/_/g, " ")}</span>`;
+  return `<span class="badge ${escapeHtml(status)}">${escapeHtml(status.replace(/_/g, " "))}</span>`;
 }
 
 let employeeFilter = "active";
@@ -251,7 +272,17 @@ async function renderEmployees() {
 async function renderApprovals() {
   const el = document.getElementById("approvals");
   try {
-    const approvals = await api("/approvals?status=pending");
+    // Escalated approvals (past their SLA deadline with no reviewer
+    // decision — see app/agent/sla_sweep.py) can no longer be approved or
+    // rejected through /approvals/{id}/decide (only PENDING is accepted),
+    // but still need to surface here — otherwise they'd silently vanish
+    // from the operator's view the moment the background sweep escalates
+    // them, even though they still represent a stuck, unresolved action.
+    const [pending, escalated] = await Promise.all([
+      api("/approvals?status=pending"),
+      api("/approvals?status=escalated"),
+    ]);
+    const approvals = [...pending, ...escalated];
     if (!approvals.length) {
       el.innerHTML = `<p class="empty">No pending approvals.</p>`;
       return;
@@ -264,10 +295,12 @@ async function renderApprovals() {
         </div>
         <div class="meta">Ticket #${a.ticket_id} · args: ${escapeHtml(JSON.stringify(a.tool_args))}</div>
         <div class="body-text">${escapeHtml(a.reasoning)}</div>
-        <div class="row" style="margin-top:8px">
+        ${a.status === "escalated"
+          ? `<div class="meta" style="margin-top:8px; color: var(--err);">Escalated — past its SLA deadline with no reviewer decision. No longer approvable/rejectable through this UI.</div>`
+          : `<div class="row" style="margin-top:8px">
           <button class="approve" onclick="decide(${a.id}, true)">Approve</button>
           <button class="reject" onclick="decide(${a.id}, false)">Reject</button>
-        </div>
+        </div>`}
       </div>
     `).join("");
   } catch (e) {
