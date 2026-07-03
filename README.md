@@ -4,6 +4,10 @@ A multi-agent-style IT automation system that processes employee onboarding/offb
 tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
 **human-in-the-loop (HITL)** approval enforced server-side for sensitive actions.
 
+
+![1783097149525](image/README/1783097149525.png)
+
+
 ## Architecture
 
 ```
@@ -191,11 +195,16 @@ curl -X POST http://127.0.0.1:8000/tickets -H "X-API-Key: $API_KEY" -H "Content-
 **3. A human reviews and decides:**
 
 ```bash
-curl -X POST http://127.0.0.1:8000/approvals/1/decide -H "X-API-Key: $API_KEY" -H "Content-Type: application/json" -d '{
-  "reviewer": "manager@example.com", "approve": true
-}'
+curl -X POST http://127.0.0.1:8000/approvals/1/decide \
+  -H "X-API-Key: $API_KEY" -H "X-Reviewer-Token: $REVIEWER_TOKEN" \
+  -H "Content-Type: application/json" -d '{"approve": true}'
 # -> graph resumes exactly where it paused; if the plan has more sensitive
 #    steps it pauses again at the next one, otherwise the ticket completes.
+# $REVIEWER_TOKEN authenticates you AS a specific reviewer (see "Identity &
+# approval authorization" below) — python -m app.db.seed prints real tokens
+# for the seeded reviewers (mchen, admin) the first time it creates them.
+# An invalid/missing token is a 401; a valid token for a reviewer not
+# entitled to decide this specific approval is a 403.
 ```
 
 **4. Inspect what actually happened:**
@@ -208,9 +217,16 @@ curl http://127.0.0.1:8000/tickets/1/audit -H "X-API-Key: $API_KEY"
 
 ```bash
 cp .env.example .env
-# set at least GROQ_API_KEY and API_KEY in .env, then:
+# set at least GROQ_API_KEY, API_KEY, and MCP_SERVER_TOKEN in .env, then:
 docker compose up --build
 ```
+
+`MCP_SERVER_TOKEN` is required in this deployment shape specifically:
+`docker-compose.yml`'s `mcp-server` service runs the gateway over
+streamable-HTTP (`--transport http`), which refuses to start without a
+bearer token configured — `docker compose up` fails fast with a clear
+error if it's unset, rather than silently starting an unauthenticated MCP
+server reachable from the Docker network.
 
 Brings up three services: `postgres` (app DB), `mcp-server` (the MCP gateway
 running standalone over streamable-HTTP — the "remote MCP server" shape),
@@ -285,15 +301,42 @@ SCIM/OpenLDAP-backed identity sync were all judged out of scope for a solo
 project per the roadmap's own trap notes, and are documented as
 deliberately skipped rather than silently missing:
 
+- **Reviewer authentication** (`app/api/auth.py`'s `require_reviewer_token`)
+  — each `Reviewer` row has its own per-reviewer secret `token`, generated
+  by `python -m app.db.seed` and required via the `X-Reviewer-Token` header
+  on `POST /approvals/{id}/decide`. This is what actually binds a decision
+  to a specific person: an earlier version of this trusted a `reviewer`
+  field in the request body, which was a self-asserted claim anyone
+  holding the one shared `API_KEY` could set to any registered reviewer's
+  name (including `admin`) — a real impersonation gap, since fixed. The
+  request body no longer has a `reviewer` field at all.
 - **Lightweight RBAC** (`app/api/rbac.py`) — layers an authorization check
-  on top of the existing free-text `reviewer` field instead of replacing it
-  with verified OIDC auth. A `reviewers` table assigns each reviewer a role
-  (`it_admin` or `manager`); `POST /approvals/{id}/decide` now rejects
-  (`403`) any reviewer not registered at all, and restricts a `manager`
-  reviewer to approvals targeting their own direct reports
-  (`EmployeeUser.manager_username`) — an `it_admin` may decide any approval.
-  This directly closes the "no RBAC concept anywhere in the schema" audit
-  finding without standing up a real identity provider.
+  on top of the now-authenticated reviewer identity. A `reviewers` table
+  assigns each reviewer a role (`it_admin` or `manager`);
+  `POST /approvals/{id}/decide` restricts a `manager` reviewer to approvals
+  targeting their own direct reports (`EmployeeUser.manager_username`) — an
+  `it_admin` may decide any approval. This directly closes the "no RBAC
+  concept anywhere in the schema" audit finding without standing up a real
+  identity provider. Read-only endpoints (`GET /approvals`,
+  `GET /tickets/{id}/audit`) are intentionally NOT scoped by this
+  relationship — this is a small-team ops dashboard, not a multi-tenant
+  system, and the real authorization boundary is who may *decide* an
+  approval, not who may *view* one.
+- **Approval replay prevention** (`app/mcp_server/approval_gate.py`) — an
+  `Approval`'s `executed_at` is set the first time it authorizes a
+  sensitive tool call; a second attempt to use the same `approval_id` is
+  refused. Previously one human sign-off could authorize the underlying
+  action an unlimited number of times (e.g. via direct MCP calls over the
+  streamable-HTTP transport, bypassing the FastAPI layer's auth entirely).
+- **MCP gateway bearer-token auth** (`app/mcp_server/server.py`) — when run
+  with `--transport http`, the gateway now requires an `Authorization: Bearer <MCP_SERVER_TOKEN>` header on every request (a Starlette
+  middleware wrapping `streamable_http_app()`). FastMCP applies zero
+  authentication of its own to this transport by default, so without this
+  any network client that could reach `MCP_SERVER_HOST:MCP_SERVER_PORT`
+  could call sensitive tools directly. Not full OAuth 2.1 (ROADMAP.md Stage
+  4.3, explicitly descoped) — a static shared token is the right-sized fix
+  for "zero auth at all." The stdio transport doesn't need this (the
+  spawned subprocess inherits trust from its parent process).
 - **Approval SLA timeout + stuck-ticket detection** (`app/agent/sla_sweep.py`)
   — every `Approval` row gets an `sla_deadline` (`APPROVAL_SLA_MINUTES`,
   default 60) at creation time. A plain `asyncio` background loop (not
@@ -311,7 +354,9 @@ deliberately skipped rather than silently missing:
 
 Run `python -m app.db.seed` to seed both mock employees (with a
 `manager_username`) and mock reviewers (`mchen`, a manager; `admin`, an
-it_admin) so this is demoable out of the box.
+it_admin) so this is demoable out of the box — the command prints each
+reviewer's token the first time it creates them (tokens aren't
+re-displayable afterward; reseed against a fresh DB if you lose one).
 
 ## Tests
 
@@ -319,29 +364,38 @@ it_admin) so this is demoable out of the box.
 pytest -v
 ```
 
-183 tests covering: tool CRUD + audit logging (including idempotency
+185 tests covering: tool CRUD + audit logging (including idempotency
 rejection for disabling an already-disabled user / revoking an ungranted
 resource, and department-based default access grants on create), the
 approval-gate security boundary (tool/argument mismatch rejection, replay
-prevention, unknown/pending/rejected approval refusal — including the
-domain-namespaced tool names each sensitive action is now checked against),
-the graph's routing/guardrail logic and human-readable result summaries, the
-API-key auth dependency, employee status filtering (current vs. past), MCP
+prevention — including a dedicated test that a second use of the same
+approved `approval_id` is refused, unknown/pending/rejected approval
+refusal — including the domain-namespaced tool names each sensitive action
+is now checked against), the graph's routing/guardrail logic and
+human-readable result summaries (including the per-plan step-count cap and
+the planner-output username format guardrail), the API-key auth dependency
+(constant-time comparison) and the per-reviewer token authentication
+dependency (including that a request supplying a reviewer's *username*
+instead of their *token* is correctly rejected — the exact impersonation
+gap that mechanism closes), the MCP gateway's streamable-HTTP bearer-token
+middleware (live, against the real gateway app: no-auth/wrong-token/
+correct-token), employee status filtering (current vs. past), MCP
 transport config selection, a live streamable-HTTP round trip against a real
 (ephemeral) MCP server, LLM-provider selection/error handling, auto-creation
 of `data/` on a fresh checkout with no existing DB files, node-level retry
 policy (fault injection against a real anyio stdio subprocess), idempotency
-keys on ticket submission, parallel fan-out timing/correctness, dynamic
-replanning on stale-plan failures, the MCP session-reuse owner-task/queue
-proxy (including a live cross-task regression test against the real
-subprocess — the exact scenario a naive shared-session design broke on),
-rate limiting, the domain-server gateway composition, the config-driven MCP
-registry, the per-domain circuit breaker (unit + integration), the
-onboarding/offboarding/access-change classifier and its specialized prompts,
-structured JSON logging with request correlation IDs, OpenTelemetry
-span/attribute instrumentation for graph nodes, LLM calls, and tool calls,
-lightweight reviewer role/relationship authorization, and the approval SLA
-timeout / stuck-ticket sweep.
+keys on ticket submission, request field-length validation, parallel
+fan-out timing/correctness, dynamic replanning on stale-plan failures, the
+MCP session-reuse owner-task/queue proxy (including a live cross-task
+regression test against the real subprocess — the exact scenario a naive
+shared-session design broke on), rate limiting, the domain-server gateway
+composition, the config-driven MCP registry, the per-domain circuit
+breaker (unit + integration), the onboarding/offboarding/access-change
+classifier and its specialized prompts, structured JSON logging with
+request correlation IDs, OpenTelemetry span/attribute instrumentation for
+graph nodes, LLM calls, and tool calls, lightweight reviewer
+role/relationship authorization, and the approval SLA timeout /
+stuck-ticket sweep.
 
 ## Notes on model choice
 
