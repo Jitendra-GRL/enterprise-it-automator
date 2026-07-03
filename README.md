@@ -204,22 +204,144 @@ curl -X POST http://127.0.0.1:8000/approvals/1/decide -H "X-API-Key: $API_KEY" -
 curl http://127.0.0.1:8000/tickets/1/audit -H "X-API-Key: $API_KEY"
 ```
 
+## Running with Docker
+
+```bash
+cp .env.example .env
+# set at least GROQ_API_KEY and API_KEY in .env, then:
+docker compose up --build
+```
+
+Brings up three services: `postgres` (app DB), `mcp-server` (the MCP gateway
+running standalone over streamable-HTTP — the "remote MCP server" shape),
+and `app` (the FastAPI service, connecting to `mcp-server` over the network
+instead of spawning it as a stdio subprocess). See `docker-compose.yml` for
+the full environment wiring and a note on what's validated vs. not yet
+(the app-DB-on-Postgres path is expected to work — `app/db/session.py` is
+already database-agnostic — but hasn't been run against a live container in
+this environment; the LangGraph checkpoint store deliberately stays on
+SQLite for now, since `AsyncPostgresSaver` hasn't been wired into
+`app/agent/runner.py` yet).
+
+## Observability
+
+Agent execution is instrumented with [OpenTelemetry](https://opentelemetry.io/)
+(`app/observability.py`): every graph node (`classify`, `plan`,
+`await_approval`, `execute_step`, `execute_batch_step`, `join_batch`,
+`replan`, `finalize`) runs inside a `agent.node.<name>` span recording
+wall-clock duration and success/error status, every LLM call records
+token usage under the GenAI semantic convention attributes
+(`gen_ai.request.model`, `gen_ai.usage.input_tokens`,
+`gen_ai.usage.output_tokens`), and every MCP tool call records
+`mcp.tool.name` / `mcp.tool.success` / `mcp.tool.domain` — the latter
+right alongside the existing per-domain circuit breaker bookkeeping in
+`app/agent/mcp_client.py`.
+
+By default `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, so `configure_observability()`
+leaves the global no-op tracer provider in place — every `start_as_current_span`
+call throughout the app is then a cheap no-op, safe to leave instrumented in
+local dev with nothing configured to receive spans. Point it at any OTLP-HTTP
+collector to start exporting — e.g. a local
+[Jaeger](https://www.jaegertracing.io/) instance, an OTel Collector forwarding
+to Langfuse/LangSmith, or a hosted OTLP endpoint:
+
+```
+OTEL_EXPORTER_OTLP_ENDPOINT=http://127.0.0.1:4318/v1/traces
+```
+
+No vendor SDK is imported directly — instrumentation always goes through
+OTel's generic API, so swapping the exporter target is a config change, not
+a call-site rewrite.
+
+## Secrets management
+
+`app/config.py`'s `Settings` (pydantic-settings) reads every credential from
+environment variables (falling back to `.env` locally) regardless of *how*
+those variables get set — so pointing the same app at a real secrets manager
+in production requires no code change, only how the process is launched:
+
+- **[Doppler](https://www.doppler.com/)** — `doppler run -- python -m uvicorn app.api.main:app`
+  injects secrets as env vars at process start; nothing in `app/` needs to
+  know Doppler exists.
+- **[Infisical](https://infisical.com/)** — same pattern via `infisical run --`,
+  or its Kubernetes operator injecting env vars/mounted files into the
+  container directly.
+- **Cloud-native equivalents** (AWS Secrets Manager + `secrets-manager-to-env`
+  style init containers, GCP Secret Manager, Azure Key Vault) all reduce to
+  the same shape: populate the environment before `app.config.get_settings()`
+  is first called, then nothing downstream changes.
+
+The one thing to avoid regardless of provider: never bake real secrets into
+the Docker image (`.dockerignore` already excludes `.env`) or commit them to
+`docker-compose.yml` — pass them at `docker run`/`docker compose up` time via
+`--env-file` or the orchestrator's native secrets injection instead.
+
+## Identity & approval authorization (scoped-down Stage 4)
+
+Two pieces of "real identity & enterprise integration" are implemented in a
+right-sized form rather than the full versions described in `ROADMAP.md`'s
+Stage 4 — a real Keycloak/OIDC deployment, MCP OAuth 2.1, and a
+SCIM/OpenLDAP-backed identity sync were all judged out of scope for a solo
+project per the roadmap's own trap notes, and are documented as
+deliberately skipped rather than silently missing:
+
+- **Lightweight RBAC** (`app/api/rbac.py`) — layers an authorization check
+  on top of the existing free-text `reviewer` field instead of replacing it
+  with verified OIDC auth. A `reviewers` table assigns each reviewer a role
+  (`it_admin` or `manager`); `POST /approvals/{id}/decide` now rejects
+  (`403`) any reviewer not registered at all, and restricts a `manager`
+  reviewer to approvals targeting their own direct reports
+  (`EmployeeUser.manager_username`) — an `it_admin` may decide any approval.
+  This directly closes the "no RBAC concept anywhere in the schema" audit
+  finding without standing up a real identity provider.
+- **Approval SLA timeout + stuck-ticket detection** (`app/agent/sla_sweep.py`)
+  — every `Approval` row gets an `sla_deadline` (`APPROVAL_SLA_MINUTES`,
+  default 60) at creation time. A plain `asyncio` background loop (not
+  APScheduler/Celery — one periodic job doesn't justify a scheduling
+  framework dependency) started from the FastAPI lifespan runs every
+  `SLA_SWEEP_INTERVAL_SECONDS` (default 300) and escalates any
+  still-`PENDING` approval past its deadline to `ESCALATED` — never
+  auto-approved or auto-rejected, since a sensitive action should never
+  execute or get silently blocked without a human decision. The same sweep
+  flags tickets stuck in `PLANNING` for over 30 minutes (a crash/orphaned
+  run past what any normal run should take). Both write an `AuditLog` entry
+  under `actor="sla_sweep"` so escalations are visible in the same trail as
+  every other action. Trigger a sweep pass on demand via
+  `POST /admin/sla-sweep`.
+
+Run `python -m app.db.seed` to seed both mock employees (with a
+`manager_username`) and mock reviewers (`mchen`, a manager; `admin`, an
+it_admin) so this is demoable out of the box.
+
 ## Tests
 
 ```bash
 pytest -v
 ```
 
-62 tests covering: tool CRUD + audit logging (including idempotency rejection
-for disabling an already-disabled user / revoking an ungranted resource, and
-department-based default access grants on create), the approval-gate security
-boundary (tool/argument mismatch rejection, replay prevention,
-unknown/pending/rejected approval refusal), the graph's routing/guardrail
-logic and human-readable result summaries, the API-key auth dependency,
-employee status filtering (current vs. past), MCP transport config selection,
-a live streamable-HTTP round trip against a real (ephemeral) MCP server,
-LLM-provider selection/error handling, and auto-creation of `data/` on a
-fresh checkout with no existing DB files.
+183 tests covering: tool CRUD + audit logging (including idempotency
+rejection for disabling an already-disabled user / revoking an ungranted
+resource, and department-based default access grants on create), the
+approval-gate security boundary (tool/argument mismatch rejection, replay
+prevention, unknown/pending/rejected approval refusal — including the
+domain-namespaced tool names each sensitive action is now checked against),
+the graph's routing/guardrail logic and human-readable result summaries, the
+API-key auth dependency, employee status filtering (current vs. past), MCP
+transport config selection, a live streamable-HTTP round trip against a real
+(ephemeral) MCP server, LLM-provider selection/error handling, auto-creation
+of `data/` on a fresh checkout with no existing DB files, node-level retry
+policy (fault injection against a real anyio stdio subprocess), idempotency
+keys on ticket submission, parallel fan-out timing/correctness, dynamic
+replanning on stale-plan failures, the MCP session-reuse owner-task/queue
+proxy (including a live cross-task regression test against the real
+subprocess — the exact scenario a naive shared-session design broke on),
+rate limiting, the domain-server gateway composition, the config-driven MCP
+registry, the per-domain circuit breaker (unit + integration), the
+onboarding/offboarding/access-change classifier and its specialized prompts,
+structured JSON logging with request correlation IDs, OpenTelemetry
+span/attribute instrumentation for graph nodes, LLM calls, and tool calls,
+lightweight reviewer role/relationship authorization, and the approval SLA
+timeout / stuck-ticket sweep.
 
 ## Notes on model choice
 
