@@ -1,5 +1,6 @@
 from functools import lru_cache
 
+from pydantic import Field
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -30,12 +31,41 @@ class Settings(BaseSettings):
     mcp_server_url: str = "http://127.0.0.1:8765/mcp"
     mcp_server_host: str = "127.0.0.1"
     mcp_server_port: int = 8765
+    # Shared secret required in the Authorization: Bearer header when the
+    # MCP gateway runs over streamable-HTTP (server.py's --transport http).
+    # The stdio transport is spec-exempt from needing this (it pulls
+    # credentials from the environment it's spawned into), but a standalone
+    # HTTP server is reachable by any network client, and the mcp SDK's
+    # FastMCP applies no authentication by default — full OAuth 2.1
+    # (Protected Resource Metadata, audience-scoped tokens) is ROADMAP.md
+    # Stage 4.3, explicitly descoped as too large for this project; a
+    # static bearer token is the right-sized fix for "zero auth at all."
+    # Left blank only for local stdio-only use — main() logs a warning and
+    # refuses to start the http transport without it.
+    mcp_server_token: str = ""
 
     sensitive_actions: str = "disable_user,revoke_access"
 
     api_host: str = "0.0.0.0"
     api_port: int = 8000
     api_key: str = ""
+
+    # OTLP HTTP endpoint (e.g. a local Langfuse/Jaeger/collector instance).
+    # Left blank by default — configure_observability() then leaves the
+    # no-op tracer provider in place, so tracing calls throughout the app
+    # stay cheap and harmless with nothing configured to receive them.
+    # validation_alias pins this to the OTel-standard env var name
+    # (OTEL_EXPORTER_OTLP_ENDPOINT) — pydantic-settings' default
+    # auto-uppercase would otherwise look for OTEL_EXPORTER_ENDPOINT
+    # instead, silently no-op'ing tracing for anyone following the
+    # documented env var name in .env.example/README.md.
+    otel_exporter_endpoint: str = Field(default="", validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT")
+
+    # Stage 4.5 (scoped down): how long a sensitive approval may sit PENDING
+    # before the background sweep (app/agent/sla_sweep.py) escalates it, and
+    # how often that sweep runs.
+    approval_sla_minutes: int = 60
+    sla_sweep_interval_seconds: int = 300
 
     @property
     def sensitive_action_set(self) -> set[str]:
