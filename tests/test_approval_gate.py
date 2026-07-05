@@ -57,6 +57,28 @@ async def test_require_approval_rejects_args_mismatch(session):
         await require_approval(session, approval.id, "disable_user", {"username": "bwayne"})
 
 
+async def test_require_approval_marks_executed_on_success(session):
+    approval = await _make_approval(session, ApprovalStatus.APPROVED)
+    assert approval.executed_at is None
+
+    await require_approval(session, approval.id, "disable_user", {"username": "asmith"})
+
+    assert approval.executed_at is not None
+
+
+async def test_require_approval_rejects_second_use_of_same_approval(session):
+    """One human sign-off must authorize exactly one execution — replaying
+    the same approval_id for a second call (e.g. an attacker who can call
+    the MCP tool directly, bypassing the FastAPI layer entirely) must be
+    refused, not silently re-executed."""
+    approval = await _make_approval(session, ApprovalStatus.APPROVED)
+
+    await require_approval(session, approval.id, "disable_user", {"username": "asmith"})
+
+    with pytest.raises(ToolError, match="already used"):
+        await require_approval(session, approval.id, "disable_user", {"username": "asmith"})
+
+
 async def test_find_approved_returns_matching_approval(session):
     approval = await _make_approval(
         session, ApprovalStatus.APPROVED, tool_args={"username": "asmith", "resource": "vpn"},
