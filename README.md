@@ -21,15 +21,18 @@ tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
 ```
 
 - **`app/mcp_server/`** — a real MCP server (built on the official `mcp` Python SDK)
-  exposing IT-provisioning tools (`get_user`, `create_user`, `grant_access`,
-  `disable_user`, `revoke_access`) over JSON-RPC, on either of two transports
-  (see **MCP transport: local vs. remote** below). `create_user` auto-grants
+  composing three domain servers (identity, access, ticketing) behind one
+  gateway, each tool exposed under a domain-prefixed name
+  (`identity_get_user`, `identity_create_user`, `identity_disable_user`,
+  `access_grant_access`, `access_revoke_access`, `ticketing_add_ticket_comment`,
+  `ticketing_get_ticket_status`) over JSON-RPC, on either of two transports
+  (see **MCP transport: local vs. remote** below). `identity_create_user` auto-grants
   a default access bundle based on the employee's `department`
   (`DEPARTMENT_ACCESS_DEFAULTS` in `tools.py` — e.g. Engineering gets
   `vpn`, `github:engineering`, `jira:core-platform`; IT additionally gets
   `admin-panel`; unmapped departments get `vpn` only), so onboarding tickets
   don't need to spell out every resource. Sensitive tools
-  (`disable_user`, `revoke_access`) require a server-verified `approval_id` —
+  (`identity_disable_user`, `access_revoke_access`) require a server-verified `approval_id` —
   the server itself refuses the call if no human has approved that *exact*
   tool + arguments combination (`approval_gate.py`). This is a real security
   boundary, not a prompt-level suggestion the LLM could talk its way past, and
