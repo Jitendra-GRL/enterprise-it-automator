@@ -9,6 +9,7 @@ local/dev use via add_tool() namespacing.
 """
 
 from mcp.server.fastmcp import FastMCP
+from mcp.types import ToolAnnotations
 
 from app.db.session import session_scope
 from app.mcp_server import tools as t
@@ -17,14 +18,28 @@ from app.mcp_server.approval_gate import require_approval
 identity_mcp = FastMCP("identity")
 
 
-@identity_mcp.tool()
+@identity_mcp.tool(
+    annotations=ToolAnnotations(
+        readOnlyHint=True, destructiveHint=False, idempotentHint=True, openWorldHint=False
+    )
+)
 async def get_user(username: str) -> dict:
     """Look up an employee's identity record: status, department, and access grants."""
     async with session_scope() as session:
         return await t.get_user(session, username)
 
 
-@identity_mcp.tool()
+@identity_mcp.tool(
+    # Not idempotent: a second call with the same username fails with
+    # "User already exists" (tools.py's create_user) rather than being a
+    # no-op success — per the annotation's own definition ("calling the
+    # tool repeatedly... will have no ADDITIONAL EFFECT"), a repeat call
+    # here has a DIFFERENT effect (an error, not a silent success), so this
+    # is correctly idempotentHint=False.
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=False, idempotentHint=False, openWorldHint=False
+    )
+)
 async def create_user(
     username: str, full_name: str, email: str, department: str = "", ticket_id: int | None = None
 ) -> dict:
@@ -35,7 +50,17 @@ async def create_user(
         )
 
 
-@identity_mcp.tool()
+@identity_mcp.tool(
+    # destructiveHint=True: disabling an account is a real, consequential
+    # state change (this is also the SENSITIVE tool requiring approval —
+    # see require_approval below). Not idempotentHint: a second call
+    # against an already-disabled user fails with "already disabled"
+    # rather than succeeding as a no-op, so a repeat call has a different
+    # observable effect (an error) than the first.
+    annotations=ToolAnnotations(
+        readOnlyHint=False, destructiveHint=True, idempotentHint=False, openWorldHint=False
+    )
+)
 async def disable_user(
     username: str, approval_id: int, ticket_id: int | None = None
 ) -> dict:
