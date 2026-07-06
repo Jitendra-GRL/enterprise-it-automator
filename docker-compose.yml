@@ -1,0 +1,127 @@
+# docker-compose.yml for local/dev container orchestration.
+#
+# NOTE on Postgres scope: DATABASE_URL below points the APP DB at Postgres.
+# app/db/session.py is already database-agnostic (plain SQLAlchemy
+# create_async_engine on whatever URL is configured) and asyncpg is a base
+# dependency, so this should work — not yet validated against a live
+# container here (blocked on a local Docker credential-helper issue during
+# development; written to be validated once that's resolved). The
+# LangGraph CHECKPOINT_DB_PATH deliberately stays on a SQLite file on a
+# named volume for now — AsyncPostgresSaver would need to be swapped in for
+# app/agent/runner.py's checkpointer before that env var could safely become
+# a Postgres URL too (that's genuinely unimplemented, unlike the app DB).
+# Don't point CHECKPOINT_DB_PATH at Postgres without making that code
+# change first.
+#
+# The mcp-server service demonstrates the "remote MCP server" deployment
+# shape (MCP_TRANSPORT=http) — the app connects to it over the network
+# instead of spawning it as a stdio subprocess, the same integration path a
+# real orchestrator (e.g. watsonx Orchestrate) would use. Comment it out and
+# set MCP_TRANSPORT=stdio on the app service to go back to the zero-config
+# local-subprocess default.
+#
+# SECURITY: mcp-server binds to 0.0.0.0 inside its container (required —
+# 127.0.0.1 would make it unreachable even from the `app` service on
+# Docker's internal bridge network), but deliberately has NO `ports:`
+# mapping published to the host — only `app` needs to reach it, via
+# Docker's internal DNS (MCP_SERVER_URL: http://mcp-server:8765/mcp
+# below), never from outside the compose network. Publishing 8765 to the
+# host here would needlessly expose the bearer-token-protected MCP gateway
+# to anything else running on the host machine (or, if the host's own
+# firewall/NAT is permissive, the wider network) for no operational
+# benefit — bearer-token auth (server.py) and DNS-rebinding Host/Origin
+# validation (MCP_ALLOWED_HOSTS/MCP_ALLOWED_ORIGINS) are real defenses,
+# but "don't expose the port at all" is a strictly stronger one available
+# here for free.
+#
+# SECURITY: POSTGRES_PASSWORD falls back to a publicly-documented default
+# (itauto_dev_pw) if unset, and port 5432 is published to the host network.
+# This default is fine for a fully local, single-user demo, but you MUST
+# set a real POSTGRES_PASSWORD in your environment (not committed anywhere)
+# before running this anywhere other than localhost — there is no runtime
+# warning if you don't, unlike API_KEY.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: itauto
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-itauto_dev_pw}
+      POSTGRES_DB: it_automator
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U itauto -d it_automator"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  mcp-server:
+    build: .
+    command:
+      ["python", "-m", "app.mcp_server.server", "--transport", "http"]
+    environment:
+      DATABASE_URL: postgresql+asyncpg://itauto:${POSTGRES_PASSWORD:-itauto_dev_pw}@postgres:5432/it_automator
+      MCP_TRANSPORT: http
+      MCP_SERVER_HOST: 0.0.0.0
+      MCP_SERVER_PORT: "8765"
+      MCP_SERVER_TOKEN: ${MCP_SERVER_TOKEN:?MCP_SERVER_TOKEN must be set — the http transport refuses to start without it}
+      # The default MCP_ALLOWED_HOSTS (127.0.0.1:<port>/localhost:<port>)
+      # wouldn't match the Host header on requests from the `app` service,
+      # which reaches this container via Docker's internal DNS name
+      # (mcp-server:8765, see MCP_SERVER_URL on the app service below) —
+      # must be listed explicitly or every real request gets a 421
+      # (DNS-rebinding Host-header rejection) from the mcp SDK's own
+      # TransportSecurityMiddleware.
+      MCP_ALLOWED_HOSTS: mcp-server:8765
+      SENSITIVE_ACTIONS: disable_user,revoke_access
+    # No `ports:` mapping — intentional, see the SECURITY note above this
+    # service. Only `app` needs to reach mcp-server, over the internal
+    # compose network; nothing here needs to be reachable from the host.
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  app:
+    build: .
+    environment:
+      DATABASE_URL: postgresql+asyncpg://itauto:${POSTGRES_PASSWORD:-itauto_dev_pw}@postgres:5432/it_automator
+      CHECKPOINT_DB_PATH: /app/data/it_automator_checkpoints.db
+      MCP_TRANSPORT: http
+      MCP_SERVER_URL: http://mcp-server:8765/mcp
+      MCP_SERVER_TOKEN: ${MCP_SERVER_TOKEN:?MCP_SERVER_TOKEN must be set — the http transport refuses to start without it}
+      SENSITIVE_ACTIONS: disable_user,revoke_access
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_MODEL: ${GROQ_MODEL:-llama-3.1-8b-instant}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      ANTHROPIC_MODEL: ${ANTHROPIC_MODEL:-claude-sonnet-4-5}
+      WATSONX_API_KEY: ${WATSONX_API_KEY:-}
+      WATSONX_PROJECT_ID: ${WATSONX_PROJECT_ID:-}
+      WATSONX_URL: ${WATSONX_URL:-https://us-south.ml.cloud.ibm.com}
+      WATSONX_MODEL: ${WATSONX_MODEL:-ibm/granite-3-8b-instruct}
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_MODEL: ${OPENROUTER_MODEL:-meta-llama/llama-3.3-70b-instruct:free}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      API_KEY: ${API_KEY:-}
+    ports:
+      - "8000:8000"
+    volumes:
+      - app_data:/app/data
+    depends_on:
+      postgres:
+        condition: service_healthy
+      mcp-server:
+        condition: service_started
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://127.0.0.1:8000/health', timeout=3)"]
+      interval: 15s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+
+volumes:
+  postgres_data:
+  app_data:
