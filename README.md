@@ -5,7 +5,7 @@ tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
 **human-in-the-loop (HITL)** approval enforced server-side for sensitive actions.
 
 
-![1783097386944](image/README/1783097386944.png)
+![1783328853502](image/README/1783328853502.png)
 
 ## Architecture
 
@@ -49,7 +49,16 @@ tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
     model, if watsonx provisioning is blocked) later.
   - The planner enforces a **structural JSON guardrail**: `_extract_json_array`
     strips markdown fences/prose and raises a clear error (routed to a
-    `FAILED` ticket state, not a crash) if the model doesn't return valid JSON.
+    `FAILED` ticket state, not a crash) if the model doesn't return valid JSON,
+    plus a hard cap on plan size (`MAX_PLAN_LENGTH`) and a format check on
+    every step's `username` arg (`_USERNAME_PATTERN`) — see **MCP discovery,
+    PII masking & prompt-injection guardrails** below.
+  - **Real MCP discovery, not a hardcoded tool list**: `discover_tool_reference()`
+    calls the live `tools/list` endpoint on every `plan`/`replan` and formats
+    whatever the server currently exposes into the prompt — the actual point
+    of MCP's discovery phase (the client asks the server what's available,
+    instead of a hand-maintained string that can silently drift from what's
+    really being served).
 - **`app/api/`** — FastAPI endpoints to submit tickets, list/inspect them,
   list/decide pending approvals, pull the per-ticket audit trail, and list
   current/past employees (`GET /employees`, `?status=active|disabled`). All
@@ -168,6 +177,42 @@ over streamable-HTTP to `MCP_SERVER_URL` instead of spawning a subprocess —
 the agent and the MCP server can then run as fully separate processes,
 potentially on separate hosts.
 
+#### Securing the HTTP transport for real deployment
+
+The `stdio` transport needs none of this (the spawned subprocess inherits
+trust from its parent process, per MCP spec 2025-11-25). The `http`
+transport is reachable by any network client that can route to it, so
+`app/mcp_server/server.py` layers on three independent protections —
+**all three are already implemented; this is deployment guidance, not a
+TODO list**:
+
+1. **Bearer-token auth** (`MCP_SERVER_TOKEN`) — required or the transport
+   refuses to start. FastMCP applies no authentication of its own.
+2. **DNS-rebinding protection** (`MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS`)
+   — the mcp SDK's own `TransportSecuritySettings`, validating the `Host`
+   and `Origin` headers on every request. Defaults to loopback-only; set
+   both explicitly if you front the gateway with a real hostname (see
+   `docker-compose.yml`'s `mcp-server` service for a worked example using
+   Docker's internal DNS name).
+3. **Per-tool rate limiting** (`app/mcp_server/rate_limit.py`) — a token
+   bucket per tool name, independent of the FastAPI layer's `slowapi`
+   limits (which only cover `POST /tickets` and the approval-decision
+   endpoint, not direct MCP tool calls).
+
+**What none of the above covers: transport encryption.** Every example in
+this README and in `docker-compose.yml` uses `http://`, which is fine on
+`127.0.0.1` or over a trusted private Docker network, but means the bearer
+token and all tool call arguments/results travel in **cleartext** the
+moment `MCP_SERVER_URL` points anywhere else. If you expose the gateway
+beyond localhost/a private network, terminate TLS in front of it — e.g. a
+reverse proxy (nginx, Caddy, a cloud load balancer) handling HTTPS and
+forwarding plaintext HTTP only over the loopback/private link to the
+gateway — and change `MCP_SERVER_URL`/`MCP_TRANSPORT`-related config on
+the agent side to point at the `https://` front door. This project doesn't
+ship that proxy config (no code change required in `app/` either way —
+it's purely how the process is fronted), the same "runtime concern, not
+an app concern" pattern as **Secrets management** above.
+
 ## Example flow
 
 **1. Onboarding (no sensitive actions — completes immediately):**
@@ -211,6 +256,81 @@ curl -X POST http://127.0.0.1:8000/approvals/1/decide \
 ```bash
 curl http://127.0.0.1:8000/tickets/1/audit -H "X-API-Key: $API_KEY"
 ```
+
+## Live streaming via AG-UI
+
+`POST /tickets` and `POST /approvals/{id}/decide` block until the graph hits
+its next interrupt or finishes, then return one JSON blob — fine for
+scripts/curl, but a UI watching a ticket in progress has to poll (the
+`app/static/index.html` dashboard polls `GET /tickets` every 8s). For a
+live view, two additional endpoints stream the SAME graph run as
+[AG-UI protocol](https://docs.ag-ui.com) events over Server-Sent Events,
+using the official `ag-ui-protocol` PyPI package:
+
+- `POST /tickets/stream` — streaming counterpart to `POST /tickets`
+- `POST /approvals/{id}/decide/stream` — streaming counterpart to
+  `POST /approvals/{id}/decide`
+
+Both take the same request body/auth as their non-streaming counterparts
+and emit `text/event-stream` frames (`app/agent/ag_ui_bridge.py`):
+
+```
+RUN_STARTED                        run begins (thread_id matches the
+                                    LangGraph checkpoint thread, so both
+                                    transports address the same run)
+STEP_STARTED / STEP_FINISHED       one pair per graph node (classify, plan,
+                                    execute_step, execute_batch_step, ...)
+TOOL_CALL_START / TOOL_CALL_RESULT one pair per MCP tool call a node executes
+STATE_DELTA                        JSON Patch (RFC 6902) fragments for
+                                    plan_index/done/category, for "step N of
+                                    M" progress without re-deriving it
+RUN_FINISHED (outcome: success)     normal completion, carrying the same
+                                    plan/results shape as RunResult
+RUN_FINISHED (outcome: interrupt)   the graph paused for approval — carries
+                                    an ag_ui.core.Interrupt (id = approval_id,
+                                    tool_call_id = tool name, metadata =
+                                    ticket_id/approval_id/tool/args) built
+                                    directly from the same payload
+                                    await_approval_node already passes to
+                                    LangGraph's interrupt() — no parallel
+                                    schema to keep in sync
+RUN_ERROR                          an exception escaped the graph run
+                                    entirely (a tool call's own failure is
+                                    reported via TOOL_CALL_RESULT instead,
+                                    same ok:false distinction RunResult uses)
+```
+
+Try it live:
+
+```bash
+curl -N -X POST http://127.0.0.1:8000/tickets/stream -H "X-API-Key: $API_KEY" \
+  -H "Content-Type: application/json" -d '{
+    "requester": "hr@example.com", "subject": "Grant access",
+    "body": "Grant jsmith access to admin-panel"
+  }'
+# -> streams RUN_STARTED, STEP_*, STATE_DELTA, ... ending in RUN_FINISHED.
+#    If a sensitive action needs approval, ends in RUN_FINISHED with
+#    outcome.type "interrupt" instead — decide it the same way as the
+#    non-streaming flow, then resume via the streaming endpoint:
+
+curl -N -X POST http://127.0.0.1:8000/approvals/1/decide/stream \
+  -H "X-API-Key: $API_KEY" -H "X-Reviewer-Token: $REVIEWER_TOKEN" \
+  -H "Content-Type: application/json" -d '{"approve": true}'
+```
+
+`app/static/index.html`'s "Submit & Watch Live (AG-UI)" button and each
+pending approval's "Approve & Watch" button drive these endpoints from the
+browser — native `EventSource` can't attach the `X-API-Key`/
+`X-Reviewer-Token` headers this API requires, so the frontend reads the SSE
+body directly off a `fetch()` stream instead (see `readSseEvents` in
+`app/static/index.html`), the same "data: `<json>`\n\n" framing
+`EventSource` parses internally.
+
+Not implemented: AG-UI's `TEXT_MESSAGE_*` / `REASONING_*` events (this
+agent's LLM calls aren't token-streamed — each `ainvoke()` returns whole)
+and `STATE_SNAPSHOT` (only incremental `STATE_DELTA` is emitted, since every
+run starts from a fresh empty client-side state document rather than
+resuming a previously-synced one across page reloads).
 
 ## Running with Docker
 
@@ -335,7 +455,10 @@ deliberately skipped rather than silently missing:
   could call sensitive tools directly. Not full OAuth 2.1 (ROADMAP.md Stage
   4.3, explicitly descoped) — a static shared token is the right-sized fix
   for "zero auth at all." The stdio transport doesn't need this (the
-  spawned subprocess inherits trust from its parent process).
+  spawned subprocess inherits trust from its parent process). See
+  **Securing the HTTP transport for real deployment** above for the other
+  two protections layered alongside this (DNS-rebinding validation,
+  per-tool rate limiting) and TLS guidance.
 - **Approval SLA timeout + stuck-ticket detection** (`app/agent/sla_sweep.py`)
   — every `Approval` row gets an `sla_deadline` (`APPROVAL_SLA_MINUTES`,
   default 60) at creation time. A plain `asyncio` background loop (not
@@ -357,13 +480,86 @@ it_admin) so this is demoable out of the box — the command prints each
 reviewer's token the first time it creates them (tokens aren't
 re-displayable afterward; reseed against a fresh DB if you lose one).
 
+## MCP discovery, PII masking & prompt-injection guardrails
+
+Three gaps closed against a standard "how well do you actually know MCP"
+checklist — the first is the most consequential, since it changes what MCP
+discovery means for this project rather than just hardening an edge case:
+
+- **Dynamic tool discovery, not a hardcoded reference** — the planner
+  prompt's tool list used to be a hand-maintained static string
+  (`TOOL_REFERENCE`) that had to be kept in sync with the real tool
+  signatures by hand, with nothing checking the two didn't drift.
+  `discover_tool_reference()` (`app/agent/graph.py`) now calls the live
+  `tools/list` endpoint via `app/agent/mcp_client.py`'s `list_tools()` on
+  every `plan_node`/`replan_node` invocation and formats whatever the
+  server currently exposes — argument names, which are required vs.
+  optional, and the tool's own description — directly into the prompt.
+  Executor-injected args (`approval_id`, always; `ticket_id`, accepted by
+  some tools but not currently populated by the executor) are filtered out
+  of what's shown to the LLM, since it should never invent a value for
+  either. The category-specific prompt files (`app/agent/prompts/`) became
+  templates with a `{tool_reference}` placeholder, filled via
+  `str.replace()` at plan time (not `str.format()` — the JSON output
+  example's literal `{...}` braces would otherwise be misread as format
+  placeholders). Domain-specific planning guidance that isn't expressible
+  in a tool's JSON Schema (e.g. department-inference rules) still lives as
+  prose in those same files — that's genuine judgment the LLM needs, not
+  tool metadata a schema can carry.
+- **PII masking before the LLM context window** — `identity_get_user`'s
+  raw record (including `full_name` and `email`) used to be embedded whole
+  into both the up-front observation (`_observe_user`) and the replan
+  progress summary — on every ticket touching an existing employee, for no
+  planning benefit, since neither field is referenced by any prompt or
+  routing logic anywhere. `_mask_pii_for_prompt()` strips both fields
+  before either call site builds its prompt; `username`, `status`,
+  `department`, and `access_grants` (the fields planning logic actually
+  uses) pass through unchanged. Best-effort by design: a non-JSON or
+  non-dict payload (e.g. a plain `ToolError` failure string) passes through
+  unmasked rather than raising, since masking must never be the reason a
+  real tool result fails to reach the planner.
+- **Prompt-injection framing** — ticket subject/body is the one genuinely
+  untrusted input in this whole pipeline (anyone who can reach
+  `POST /tickets` controls it), and it's embedded directly into four
+  separate LLM calls (username extraction, classification, planning,
+  replanning). `_wrap_untrusted_ticket_text()` now wraps it in explicit
+  `TICKET_TEXT_START_UNTRUSTED_USER_INPUT` / `..._END` delimiters at every
+  one of those call sites, paired with a matching system-prompt instruction
+  (`PROMPT_INJECTION_GUARDRAIL`, threaded into all three category prompts
+  plus the classify/username-extraction prompts) telling the LLM to treat
+  delimited content strictly as data, never as instructions that change its
+  role or output format. This is documented as a mitigation, not a
+  guarantee — no prompt-level defense fully stops a determined injection.
+  The real security boundary stays server-side and untouched by this: plan
+  size (`MAX_PLAN_LENGTH`), username format (`_USERNAME_PATTERN`), and
+  approval enforcement (`approval_gate.require_approval`) all validate the
+  LLM's *output*, regardless of what convinced it to produce that output.
+- **DNS-rebinding protection, per-tool rate limiting, tool annotations** —
+  a follow-up pass against the MCP spec's own Transports/Tools/Security
+  Best Practices pages found four more gaps, all closed: (1) the mcp SDK's
+  own `TransportSecuritySettings` (Host/Origin header validation) is now
+  enabled on the streamable-HTTP gateway rather than left off by default —
+  see **Securing the HTTP transport for real deployment** above; (2)
+  `app/mcp_server/rate_limit.py` adds a per-tool-name token bucket inside
+  the gateway's own tool dispatch (`server.py`'s `_compose_gateway`),
+  closing the gap where `slowapi`'s HTTP-layer limits never applied to a
+  caller invoking MCP tools directly; (3) every registered tool now
+  carries `readOnlyHint`/`destructiveHint`/`idempotentHint`/`openWorldHint`
+  annotations (e.g. `identity_disable_user` is `destructiveHint=True`,
+  `identity_get_user` is `readOnlyHint=True`), propagated through the
+  gateway's `add_tool()` re-registration rather than dropped; (4)
+  `docker-compose.yml`'s `mcp-server` service no longer publishes its port
+  to the host — only the `app` service needs to reach it, over Docker's
+  internal network, and the bearer token doesn't need a second, needless
+  network exposure to defend.
+
 ## Tests
 
 ```bash
 pytest -v
 ```
 
-185 tests covering: tool CRUD + audit logging (including idempotency
+228 tests covering: tool CRUD + audit logging (including idempotency
 rejection for disabling an already-disabled user / revoking an ungranted
 resource, and department-based default access grants on create), the
 approval-gate security boundary (tool/argument mismatch rejection, replay
@@ -376,25 +572,37 @@ the planner-output username format guardrail), the API-key auth dependency
 (constant-time comparison) and the per-reviewer token authentication
 dependency (including that a request supplying a reviewer's *username*
 instead of their *token* is correctly rejected — the exact impersonation
-gap that mechanism closes), the MCP gateway's streamable-HTTP bearer-token
-middleware (live, against the real gateway app: no-auth/wrong-token/
-correct-token), employee status filtering (current vs. past), MCP
-transport config selection, a live streamable-HTTP round trip against a real
-(ephemeral) MCP server, LLM-provider selection/error handling, auto-creation
-of `data/` on a fresh checkout with no existing DB files, node-level retry
-policy (fault injection against a real anyio stdio subprocess), idempotency
-keys on ticket submission, request field-length validation, parallel
-fan-out timing/correctness, dynamic replanning on stale-plan failures, the
-MCP session-reuse owner-task/queue proxy (including a live cross-task
-regression test against the real subprocess — the exact scenario a naive
-shared-session design broke on), rate limiting, the domain-server gateway
-composition, the config-driven MCP registry, the per-domain circuit
-breaker (unit + integration), the onboarding/offboarding/access-change
-classifier and its specialized prompts, structured JSON logging with
-request correlation IDs, OpenTelemetry span/attribute instrumentation for
-graph nodes, LLM calls, and tool calls, lightweight reviewer
-role/relationship authorization, and the approval SLA timeout /
-stuck-ticket sweep.
+gap that mechanism closes), the MCP gateway's streamable-HTTP transport
+security (live, against the real gateway app: bearer-token
+no-auth/wrong-token/correct-token, and DNS-rebinding Host/Origin header
+validation — disallowed/allowlisted/absent Origin, all against the mcp
+SDK's own `TransportSecurityMiddleware`), the per-tool rate limiter (token
+bucket behavior, independence across tools, and that gateway tools
+propagate their annotations — `readOnlyHint`/`destructiveHint`/
+`idempotentHint`/`openWorldHint` — through `add_tool()` re-registration),
+the dynamic tool-discovery formatter (required vs. optional args,
+executor-injected-arg filtering, meta-tool exclusion), PII masking before
+an employee record reaches an LLM prompt, employee status filtering
+(current vs. past), MCP transport config selection, a live streamable-HTTP
+round trip against a real (ephemeral) MCP server, LLM-provider
+selection/error handling, auto-creation of `data/` on a fresh checkout with
+no existing DB files, node-level retry policy (fault injection against a
+real anyio stdio subprocess), idempotency keys on ticket submission,
+request field-length validation, parallel fan-out timing/correctness,
+dynamic replanning on stale-plan failures, the MCP session-reuse
+owner-task/queue proxy (including a live cross-task regression test
+against the real subprocess — the exact scenario a naive shared-session
+design broke on), rate limiting, the domain-server gateway composition,
+the config-driven MCP registry, the per-domain circuit breaker (unit +
+integration), the onboarding/offboarding/access-change classifier and its
+specialized prompts, structured JSON logging with request correlation IDs,
+OpenTelemetry span/attribute instrumentation for graph nodes, LLM calls,
+and tool calls, lightweight reviewer role/relationship authorization, the
+approval SLA timeout / stuck-ticket sweep, and the AG-UI event bridge (pure
+translation helpers, a full run against a real compiled graph through
+completion/tool-execution/interrupt/error paths, a resume picking up from a
+checkpointed interrupt, and the two streaming FastAPI endpoints' auth/DB
+wiring) — see **Live streaming via AG-UI** above.
 
 ## Notes on model choice
 
