@@ -1,0 +1,47 @@
+# Render Blueprint — deploys the pre-built image already published to GHCR.
+# No build step: Render just pulls ghcr.io/jitendraprabhu-l/enterprise-it-automator,
+# the same image verified locally via docker-compose and pushed by
+# .github/workflows/deploy.yml.
+#
+# MCP_TRANSPORT is left at its default ("stdio") — the agent spawns the MCP
+# server as an in-process subprocess, so this is a single Render service, not
+# the two-service split docker-compose.yml uses for demonstrating the
+# standalone-HTTP-transport shape. No MCP_SERVER_TOKEN/MCP_ALLOWED_HOSTS
+# needed under stdio.
+#
+# Every secret below uses `sync: false` — Render prompts for the real value
+# once when the Blueprint is first created and never overwrites it on later
+# syncs, so nothing sensitive is ever committed to this public repo. Fill
+# real values in via the Render dashboard, not by editing this file.
+#
+# To use: Render dashboard → New → Blueprint → point at this repo → it reads
+# this file automatically.
+
+services:
+  - name: enterprise-it-automator
+    type: web
+    runtime: image
+    image:
+      url: ghcr.io/jitendraprabhu-l/enterprise-it-automator:latest
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      # --- Required secrets: set these in the Render dashboard, not here ---
+      - key: API_KEY
+        sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: CHECKPOINT_DB_PATH
+        sync: false
+      - key: GROQ_API_KEY
+        sync: false
+
+      # --- Non-secret config, safe to commit ---
+      - key: LLM_PROVIDER
+        value: groq
+      - key: SENSITIVE_ACTIONS
+        value: disable_user,revoke_access
+      - key: APPROVAL_SLA_MINUTES
+        value: "60"
+      - key: SLA_SWEEP_INTERVAL_SECONDS
+        value: "300"
