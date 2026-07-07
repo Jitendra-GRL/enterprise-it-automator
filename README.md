@@ -1,11 +1,52 @@
 # MCP-Enabled Enterprise IT Automator
 
+[![CI](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/ci.yml)
+[![Build and Push Image](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/deploy.yml/badge.svg)](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/deploy.yml)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 A multi-agent-style IT automation system that processes employee onboarding/offboarding
 tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
 **human-in-the-loop (HITL)** approval enforced server-side for sensitive actions.
 
+![Dashboard screenshot](docs/dashboard-screenshot.png)
 
-![1783328853502](image/README/1783328853502.png)
+## Quick start
+
+```bash
+git clone https://github.com/JitendraPrabhu-l/enterprise-it-automator.git
+cd enterprise-it-automator
+python -m venv .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
+pip install -r requirements.txt
+
+cp .env.example .env
+# edit .env: set GROQ_API_KEY (free: https://console.groq.com/keys) and API_KEY (any secret string)
+
+python -m app.db.seed                 # seeds mock employees + reviewer tokens (printed once)
+python -m uvicorn app.api.main:app --reload
+```
+
+Open `http://127.0.0.1:8000/` for the dashboard, or `http://127.0.0.1:8000/docs` for the
+interactive API reference. See **[Setup](#setup)** below for the full walkthrough, or
+**[Deployment](DEPLOYMENT.md)** to run this against a real Postgres database on Render.
+
+Prefer containers? `docker compose up --build` — see **[Running with Docker](#running-with-docker)**.
+
+## Contents
+
+- [Architecture](#architecture)
+- [Setup](#setup)
+- [MCP transport: local vs. remote](#mcp-transport-local-vs-remote)
+- [Example flow](#example-flow)
+- [Live streaming via AG-UI](#live-streaming-via-ag-ui)
+- [Running with Docker](#running-with-docker)
+- [Observability](#observability)
+- [Secrets management](#secrets-management)
+- [Identity & approval authorization](#identity--approval-authorization-scoped-down-stage-4)
+- [MCP discovery, PII masking & prompt-injection guardrails](#mcp-discovery-pii-masking--prompt-injection-guardrails)
+- [Tests](#tests)
+- [Notes on model choice](#notes-on-model-choice)
+- [Contributing](CONTRIBUTING.md)
+- [Deployment guide](DEPLOYMENT.md)
 
 ## Architecture
 
@@ -559,53 +600,39 @@ discovery means for this project rather than just hardening an edge case:
 ## Tests
 
 ```bash
-pytest -v
+pytest -v          # full suite
+ruff check app/ tests/    # lint
 ```
 
-228 tests covering: tool CRUD + audit logging (including idempotency
-rejection for disabling an already-disabled user / revoking an ungranted
-resource, and department-based default access grants on create), the
-approval-gate security boundary (tool/argument mismatch rejection, replay
-prevention — including a dedicated test that a second use of the same
-approved `approval_id` is refused, unknown/pending/rejected approval
-refusal — including the domain-namespaced tool names each sensitive action
-is now checked against), the graph's routing/guardrail logic and
-human-readable result summaries (including the per-plan step-count cap and
-the planner-output username format guardrail), the API-key auth dependency
-(constant-time comparison) and the per-reviewer token authentication
-dependency (including that a request supplying a reviewer's *username*
-instead of their *token* is correctly rejected — the exact impersonation
-gap that mechanism closes), the MCP gateway's streamable-HTTP transport
-security (live, against the real gateway app: bearer-token
-no-auth/wrong-token/correct-token, and DNS-rebinding Host/Origin header
-validation — disallowed/allowlisted/absent Origin, all against the mcp
-SDK's own `TransportSecurityMiddleware`), the per-tool rate limiter (token
-bucket behavior, independence across tools, and that gateway tools
-propagate their annotations — `readOnlyHint`/`destructiveHint`/
-`idempotentHint`/`openWorldHint` — through `add_tool()` re-registration),
-the dynamic tool-discovery formatter (required vs. optional args,
-executor-injected-arg filtering, meta-tool exclusion), PII masking before
-an employee record reaches an LLM prompt, employee status filtering
-(current vs. past), MCP transport config selection, a live streamable-HTTP
-round trip against a real (ephemeral) MCP server, LLM-provider
-selection/error handling, auto-creation of `data/` on a fresh checkout with
-no existing DB files, node-level retry policy (fault injection against a
-real anyio stdio subprocess), idempotency keys on ticket submission,
-request field-length validation, parallel fan-out timing/correctness,
-dynamic replanning on stale-plan failures, the MCP session-reuse
-owner-task/queue proxy (including a live cross-task regression test
-against the real subprocess — the exact scenario a naive shared-session
-design broke on), rate limiting, the domain-server gateway composition,
-the config-driven MCP registry, the per-domain circuit breaker (unit +
-integration), the onboarding/offboarding/access-change classifier and its
-specialized prompts, structured JSON logging with request correlation IDs,
-OpenTelemetry span/attribute instrumentation for graph nodes, LLM calls,
-and tool calls, lightweight reviewer role/relationship authorization, the
-approval SLA timeout / stuck-ticket sweep, and the AG-UI event bridge (pure
-translation helpers, a full run against a real compiled graph through
-completion/tool-execution/interrupt/error paths, a resume picking up from a
-checkpointed interrupt, and the two streaming FastAPI endpoints' auth/DB
-wiring) — see **Live streaming via AG-UI** above.
+264 tests (`tests/`, one file per module under test) covering, at a high level:
+
+- **Tool layer** — CRUD + audit logging, idempotency rejection (disabling an
+  already-disabled user, revoking an ungranted resource), department-based
+  default access grants.
+- **Security boundaries** — the approval-gate (tool/argument-mismatch
+  rejection, replay prevention), per-caller API-client auth and scoping
+  (`ApiClient` admin vs. standard roles, ticket/audit read scoping, daily
+  request caps), reviewer-token authentication and RBAC, the MCP gateway's
+  bearer-token + DNS-rebinding protections (live, against the real gateway
+  app), and the target-username/ticket-text mismatch check.
+- **Agent graph** — routing/guardrail logic, plan-size and username-format
+  guardrails, parallel fan-out timing/correctness, dynamic replanning,
+  ticket_id injection for audit attribution, PII masking before prompts,
+  prompt-injection framing, node-level retry policy (fault injection
+  against a real subprocess).
+- **MCP layer** — dynamic tool discovery, per-tool rate limiting, per-domain
+  circuit breakers, the domain-server gateway composition, the config-driven
+  registry, session-reuse owner-task/queue proxy (including a live
+  cross-task regression test against a real subprocess).
+- **Infrastructure** — checkpointer backend selection (SQLite vs. Postgres),
+  concurrent-worker startup safety, SLA timeout / stuck-ticket sweep,
+  idempotency keys, structured logging, OpenTelemetry instrumentation, and
+  the AG-UI streaming bridge end-to-end (a full run against a real compiled
+  graph through completion/interrupt/error paths, plus the two streaming
+  FastAPI endpoints' auth/DB wiring — see **Live streaming via AG-UI** above).
+
+CI (`.github/workflows/ci.yml`) runs the full suite plus `ruff` on every push/PR
+to `main`; `deploy.yml` builds and publishes the Docker image to GHCR once CI passes.
 
 ## Notes on model choice
 
