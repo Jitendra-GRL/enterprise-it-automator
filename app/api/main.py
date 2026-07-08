@@ -195,14 +195,23 @@ async def request_id_middleware(request: Request, call_next):
 STATIC_DIR = Path(__file__).resolve().parent.parent / "static"
 
 
-@app.get("/health")
+@app.api_route("/health", methods=["GET", "HEAD"])
 async def health() -> dict:
+    # Explicit methods=["GET", "HEAD"], not the bare @app.get shorthand:
+    # FastAPI 0.139.0 does not auto-add HEAD support the way Starlette's own
+    # Route claims to (confirmed live — uptime monitors like shields.io and
+    # Better Stack, both documented in DEPLOYMENT.md, issue HEAD requests
+    # against /health by default, and every one of them got a 405 here,
+    # rendering this app as permanently "down" on their dashboards/badges
+    # despite GET /health responding 200 the entire time). Reproduced with a
+    # minimal two-line FastAPI app on this exact pinned version — an
+    # upstream framework quirk, not anything specific to this route.
     from app.mcp_server.circuit_breaker import snapshot_all_breakers
 
     return {"status": "ok", "mcp_domains": snapshot_all_breakers()}
 
 
-@app.get("/ready")
+@app.api_route("/ready", methods=["GET", "HEAD"])
 async def ready() -> JSONResponse:
     """Readiness probe: verifies the app DB is actually reachable (not just
     that the process is up) and that the LangGraph checkpointer has been
