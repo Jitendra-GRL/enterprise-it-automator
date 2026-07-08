@@ -8,6 +8,11 @@ A multi-agent-style IT automation system that processes employee onboarding/offb
 tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
 **human-in-the-loop (HITL)** approval enforced server-side for sensitive actions.
 
+**Live demo:** [enterprise-it-automator.onrender.com](https://enterprise-it-automator.onrender.com/)
+— the dashboard auto-fills a public, low-privilege demo key so you can submit a ticket
+without asking for a credential (may take ~30–60s to wake up on the free tier's first
+request after idling).
+
 ![Dashboard screenshot](docs/dashboard-screenshot.png)
 
 ## Quick start
