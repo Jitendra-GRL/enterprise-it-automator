@@ -117,17 +117,17 @@
 <div id="howItWorksOverlay" style="display:none; position:fixed; inset:0; background:rgba(0,0,0,.6); z-index:100; align-items:center; justify-content:center; padding:20px;" onclick="if(event.target===this) closeHowItWorks()">
   <div style="background:var(--panel); border:1px solid var(--border); border-radius:10px; max-width:560px; width:100%; max-height:85vh; overflow-y:auto; padding:24px 28px;">
     <div style="display:flex; justify-content:space-between; align-items:center; margin-bottom:14px;">
-      <h2 style="margin:0; font-size:15px;">How this system works</h2>
+      <h2 style="margin:0; font-size:15px; color:var(--text);">How this system works</h2>
       <button type="button" class="link-btn" style="text-decoration:none; font-size:18px; line-height:1;" onclick="closeHowItWorks()">✕</button>
     </div>
     <ol style="margin:0; padding-left:20px; font-size:13px; line-height:1.7; color:var(--text);">
-      <li><strong>Tools &amp; framework:</strong> a LangGraph agent plans against a real MCP (Model Context Protocol) server — 3 domain servers (identity, access, ticketing), 9 tools total, discovered live via <code class="tool">tools/list</code> on every plan, not hardcoded.</li>
-      <li><strong>HITL (human-in-the-loop):</strong> sensitive actions (disable/enable a user, revoke access) pause the agent via LangGraph's <code class="tool">interrupt()</code> and require a real person's sign-off before they execute — never auto-approved.</li>
-      <li><strong>Approval:</strong> a reviewer holding a valid token decides via the dashboard, or via Telegram (if configured) — both paths share the exact same authorization check.</li>
-      <li><strong>Rejection:</strong> a rejected approval marks the ticket <code class="tool">rejected</code> immediately and the agent never runs the sensitive step.</li>
-      <li><strong>Escalation:</strong> a pending approval left undecided past its SLA deadline is auto-flagged <code class="tool">escalated</code> by a background sweep, so nothing silently sits forever.</li>
-      <li><strong>AG-UI:</strong> "Submit &amp; Watch Live" streams the agent's plan/execute/tool-call events over the AG-UI protocol in real time, instead of waiting for the whole run to finish.</li>
-      <li><strong>Failure handling:</strong> a step that fails on a stale assumption (e.g. already disabled) triggers a replan instead of a hard error; a ticket whose action never actually ran is marked <code class="tool">failed</code>, not a false "completed."</li>
+      <li><strong style="color:var(--text);">Tools &amp; framework:</strong> a LangGraph agent plans against a real MCP (Model Context Protocol) server — 3 domain servers (identity, access, ticketing), 9 tools total, discovered live via <code class="tool">tools/list</code> on every plan, not hardcoded.</li>
+      <li><strong style="color:var(--text);">HITL (human-in-the-loop):</strong> sensitive actions (disable/enable a user, revoke access) pause the agent via LangGraph's <code class="tool">interrupt()</code> and require a real person's sign-off before they execute — never auto-approved.</li>
+      <li><strong style="color:var(--text);">Approval:</strong> a reviewer holding a valid token decides via the dashboard, or via Telegram (if configured) — both paths share the exact same authorization check.</li>
+      <li><strong style="color:var(--text);">Rejection:</strong> a rejected approval marks the ticket <code class="tool">rejected</code> immediately and the agent never runs the sensitive step.</li>
+      <li><strong style="color:var(--text);">Escalation:</strong> a pending approval left undecided past its SLA deadline is auto-flagged <code class="tool">escalated</code> by a background sweep, so nothing silently sits forever.</li>
+      <li><strong style="color:var(--text);">AG-UI:</strong> "Submit &amp; Watch Live" streams the agent's plan/execute/tool-call events over the AG-UI protocol in real time, instead of waiting for the whole run to finish.</li>
+      <li><strong style="color:var(--text);">Failure handling:</strong> a step that fails on a stale assumption (e.g. already disabled) triggers a replan instead of a hard error; a ticket whose action never actually ran is marked <code class="tool">failed</code>, not a false "completed."</li>
     </ol>
   </div>
 </div>
