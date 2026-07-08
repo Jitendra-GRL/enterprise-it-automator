@@ -293,9 +293,13 @@
     <section class="panel">
       <div class="toolbar">
         <h2 style="margin:0">Pending Approvals</h2>
-        <button class="secondary" onclick="refreshAll()">Refresh</button>
+        <div class="row">
+          <button class="link-btn" id="showEscalatedBtn" onclick="toggleShowEscalated()" style="display:none"></button>
+          <button class="secondary" onclick="refreshAll()">Refresh</button>
+        </div>
       </div>
       <div id="approvals"><p class="empty">Loading…</p></div>
+      <div id="escalatedApprovals" style="display:none; margin-top:16px; padding-top:16px; border-top:1px solid var(--border);"></div>
     </section>
 
     <section class="panel">
@@ -623,25 +627,8 @@ async function renderEmployees() {
   }
 }
 
-async function renderApprovals() {
-  const el = document.getElementById("approvals");
-  try {
-    // Escalated approvals (past their SLA deadline with no reviewer
-    // decision — see app/agent/sla_sweep.py) can no longer be approved or
-    // rejected through /approvals/{id}/decide (only PENDING is accepted),
-    // but still need to surface here — otherwise they'd silently vanish
-    // from the operator's view the moment the background sweep escalates
-    // them, even though they still represent a stuck, unresolved action.
-    const [pending, escalated] = await Promise.all([
-      api("/approvals?status=pending"),
-      api("/approvals?status=escalated"),
-    ]);
-    const approvals = [...pending, ...escalated];
-    if (!approvals.length) {
-      el.innerHTML = `<p class="empty">No pending approvals.</p>`;
-      return;
-    }
-    el.innerHTML = approvals.map(a => `
+function approvalCard(a) {
+  return `
       <div class="card">
         <div class="card-head">
           <strong>#${a.id} · <code class="tool">${escapeHtml(a.tool_name)}</code></strong>
@@ -657,7 +644,49 @@ async function renderApprovals() {
           <button class="secondary" onclick="decideStream(${a.id}, true)" title="Approve and stream the resumed run's AG-UI events live">Approve &amp; Watch</button>
         </div>`}
       </div>
-    `).join("");
+    `;
+}
+
+let showEscalated = false;
+
+function toggleShowEscalated() {
+  showEscalated = !showEscalated;
+  renderApprovals();
+}
+
+async function renderApprovals() {
+  const el = document.getElementById("approvals");
+  const escalatedEl = document.getElementById("escalatedApprovals");
+  const escalatedBtn = document.getElementById("showEscalatedBtn");
+  try {
+    // Escalated approvals (past their SLA deadline with no reviewer
+    // decision — see app/agent/sla_sweep.py) can no longer be approved or
+    // rejected through /approvals/{id}/decide (only PENDING is accepted).
+    // Kept out of the main Pending Approvals list — an operator scanning
+    // that list needs to see only what's actually actionable right now —
+    // but still surfaced via a separate "Show escalated" toggle so a stuck,
+    // unresolved action never silently disappears from view entirely.
+    const [pending, escalated] = await Promise.all([
+      api("/approvals?status=pending"),
+      api("/approvals?status=escalated"),
+    ]);
+
+    el.innerHTML = pending.length
+      ? pending.map(approvalCard).join("")
+      : `<p class="empty">No pending approvals.</p>`;
+
+    if (escalated.length) {
+      escalatedBtn.style.display = "inline";
+      escalatedBtn.textContent = showEscalated
+        ? `Hide escalated (${escalated.length})`
+        : `Show escalated (${escalated.length})`;
+      escalatedEl.style.display = showEscalated ? "block" : "none";
+      escalatedEl.innerHTML = showEscalated ? escalated.map(approvalCard).join("") : "";
+    } else {
+      escalatedBtn.style.display = "none";
+      escalatedEl.style.display = "none";
+      escalatedEl.innerHTML = "";
+    }
   } catch (e) {
     el.innerHTML = `<p class="empty">Failed to load approvals: ${escapeHtml(e.message)}</p>`;
   }
