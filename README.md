@@ -3,7 +3,7 @@
 [![CI](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/ci.yml)
 [![Build and Push Image](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/deploy.yml/badge.svg)](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/deploy.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
-[![Live](https://img.shields.io/website?url=https%3A%2F%2Fenterprise-it-automator.onrender.com%2Fhealth&up_message=online&down_message=active&label=Live)](https://enterprise-it-automator.onrender.com/)
+[![Live](https://img.shields.io/website?url=https%3A%2F%2Fenterprise-it-automator.onrender.com%2Fhealth&up_message=active&down_message=asleep&label=Live)](https://enterprise-it-automator.onrender.com/)
 
 A multi-agent-style IT automation system that processes employee onboarding/offboarding
 tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
