@@ -15,6 +15,13 @@ A real Postgres connection is the only way to reproduce the actual race
 (SQLite doesn't have ENUM types to collide on), so this test instead pins
 the narrower, real-Postgres-independent contract: init_db() must swallow
 IntegrityError from the create_all call, not propagate it.
+
+init_db() also runs _ensure_tickets_submitted_by_client_id_column
+afterward (a separate, self-healing ADD COLUMN step for an existing
+database predating that column — see its own docstring in
+app/db/session.py) — these tests patch that function out directly rather
+than mock engine.begin() at a level both calls share, so each test targets
+only the one code path it's actually about.
 """
 
 from unittest.mock import AsyncMock, MagicMock, patch
@@ -37,7 +44,8 @@ async def test_init_db_swallows_integrity_error_from_concurrent_create_type():
     fake_engine.begin = MagicMock(return_value=fake_begin_cm)
 
     with patch("app.db.session.get_engine", return_value=fake_engine):
-        await init_db()  # must not raise
+        with patch("app.db.session._ensure_tickets_submitted_by_client_id_column", AsyncMock()):
+            await init_db()  # must not raise
 
 
 async def test_init_db_still_propagates_other_errors(monkeypatch):
@@ -55,5 +63,6 @@ async def test_init_db_still_propagates_other_errors(monkeypatch):
     fake_engine.begin = MagicMock(return_value=fake_begin_cm)
 
     with patch("app.db.session.get_engine", return_value=fake_engine):
-        with pytest.raises(ConnectionError):
-            await init_db()
+        with patch("app.db.session._ensure_tickets_submitted_by_client_id_column", AsyncMock()):
+            with pytest.raises(ConnectionError):
+                await init_db()

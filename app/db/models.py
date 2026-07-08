@@ -170,6 +170,27 @@ class Ticket(Base):
         Enum(TicketStatus), default=TicketStatus.RECEIVED
     )
     result_summary: Mapped[str] = mapped_column(Text, default="")
+    # WHO actually authenticated the POST /tickets call that created this
+    # row — nullable because API_KEY-unset (local demo mode) submissions
+    # have no ApiClient at all, and because pre-existing rows from before
+    # this column existed have no way to backfill it. Deliberately NOT the
+    # same thing as `requester` above: requester is free-text the caller
+    # puts in the request BODY (e.g. "hr@example.com" as who the ticket is
+    # ostensibly filed on behalf of) and is under the caller's full control
+    # — nothing ties it to which credential actually made the call. A
+    # security-review follow-up found this the hard way on a live public
+    # demo: app/api/main.py's ticket/audit/approval read-scoping compared
+    # `Ticket.requester == client.name`, so a caller submitting with a
+    # `requester` value that didn't happen to equal their own ApiClient's
+    # `name` (the demo client is literally named "public-demo-guest", never
+    # equal to any requester a visitor would type) couldn't see their OWN
+    # just-submitted ticket, and conversely nothing stopped one caller from
+    # seeing another's ticket by guessing/matching the right requester
+    # string. This column is the real ownership link; requester stays
+    # purely descriptive.
+    submitted_by_client_id: Mapped[int | None] = mapped_column(
+        ForeignKey("api_clients.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

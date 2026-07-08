@@ -59,11 +59,22 @@ async def client(monkeypatch, tmp_path):
     get_settings.cache_clear()
 
 
-async def _seed_ticket(requester: str) -> int:
+async def _client_id_for_key(key: str) -> int:
+    from app.db.models import ApiClient
+
+    async with db_session_module.session_scope() as session:
+        row = await session.scalar(select(ApiClient).where(ApiClient.key == key))
+        return row.id
+
+
+async def _seed_ticket(requester: str, submitted_by_client_id: int | None) -> int:
     from app.db.models import Ticket, TicketStatus
 
     async with db_session_module.session_scope() as session:
-        ticket = Ticket(requester=requester, subject="s", body="b", status=TicketStatus.COMPLETED)
+        ticket = Ticket(
+            requester=requester, subject="s", body="b", status=TicketStatus.COMPLETED,
+            submitted_by_client_id=submitted_by_client_id,
+        )
         session.add(ticket)
         await session.flush()
         return ticket.id
@@ -71,7 +82,8 @@ async def _seed_ticket(requester: str) -> int:
 
 async def test_admin_client_sees_ticket_filed_by_anyone(client):
     ac, _ = client
-    ticket_id = await _seed_ticket("hr@example.com")
+    hr_id = await _client_id_for_key("hr-standard-key")
+    ticket_id = await _seed_ticket("hr@example.com", hr_id)
 
     resp = await ac.get(f"/tickets/{ticket_id}", headers={"X-API-Key": "admin-bootstrap-key"})
     assert resp.status_code == 200
@@ -80,11 +92,26 @@ async def test_admin_client_sees_ticket_filed_by_anyone(client):
 
 async def test_standard_client_sees_its_own_ticket(client):
     ac, _ = client
-    ticket_id = await _seed_ticket("hr@example.com")
+    hr_id = await _client_id_for_key("hr-standard-key")
+    ticket_id = await _seed_ticket("hr@example.com", hr_id)
 
     resp = await ac.get(f"/tickets/{ticket_id}", headers={"X-API-Key": "hr-standard-key"})
     assert resp.status_code == 200
     assert resp.json()["requester"] == "hr@example.com"
+
+
+async def test_standard_client_sees_its_own_ticket_even_when_requester_field_differs(client):
+    """Regression test for a real bug found live on the public demo: ticket
+    ownership is by submitted_by_client_id (who authenticated the call), NOT
+    by matching the free-text `requester` field to the client's own `name`.
+    A client submitting with an unrelated requester string must still see
+    its own ticket."""
+    ac, _ = client
+    hr_id = await _client_id_for_key("hr-standard-key")
+    ticket_id = await _seed_ticket("some-other-name@example.com", hr_id)
+
+    resp = await ac.get(f"/tickets/{ticket_id}", headers={"X-API-Key": "hr-standard-key"})
+    assert resp.status_code == 200
 
 
 async def test_standard_client_cannot_see_another_clients_ticket(client):
@@ -92,16 +119,34 @@ async def test_standard_client_cannot_see_another_clients_ticket(client):
     ticket filed by finance@example.com — a 404, not a 403, so as not to
     even confirm the ticket ID exists to a caller who shouldn't see it."""
     ac, _ = client
-    ticket_id = await _seed_ticket("hr@example.com")
+    finance_id = await _client_id_for_key("finance-standard-key")
+    ticket_id = await _seed_ticket("hr@example.com", finance_id)
 
     resp = await ac.get(f"/tickets/{ticket_id}", headers={"X-API-Key": "finance-standard-key"})
+    assert resp.status_code != 404  # sanity: the owner CAN see it
+    resp = await ac.get(f"/tickets/{ticket_id}", headers={"X-API-Key": "hr-standard-key"})
+    assert resp.status_code == 404
+
+
+async def test_standard_client_cannot_see_another_clients_ticket_even_with_matching_requester(client):
+    """Regression test for the other half of the live bug: previously a
+    caller could see someone else's ticket just by submitting with a
+    requester string matching the target client's name — ownership must be
+    checked via submitted_by_client_id regardless of what requester says."""
+    ac, _ = client
+    finance_id = await _client_id_for_key("finance-standard-key")
+    ticket_id = await _seed_ticket("hr@example.com", finance_id)  # requester says "hr", owner is finance
+
+    resp = await ac.get(f"/tickets/{ticket_id}", headers={"X-API-Key": "hr-standard-key"})
     assert resp.status_code == 404
 
 
 async def test_standard_client_list_tickets_only_shows_own(client):
     ac, _ = client
-    await _seed_ticket("hr@example.com")
-    await _seed_ticket("finance@example.com")
+    hr_id = await _client_id_for_key("hr-standard-key")
+    finance_id = await _client_id_for_key("finance-standard-key")
+    await _seed_ticket("hr@example.com", hr_id)
+    await _seed_ticket("finance@example.com", finance_id)
 
     resp = await ac.get("/tickets", headers={"X-API-Key": "hr-standard-key"})
     assert resp.status_code == 200
@@ -111,8 +156,10 @@ async def test_standard_client_list_tickets_only_shows_own(client):
 
 async def test_admin_client_list_tickets_shows_everyone(client):
     ac, _ = client
-    await _seed_ticket("hr@example.com")
-    await _seed_ticket("finance@example.com")
+    hr_id = await _client_id_for_key("hr-standard-key")
+    finance_id = await _client_id_for_key("finance-standard-key")
+    await _seed_ticket("hr@example.com", hr_id)
+    await _seed_ticket("finance@example.com", finance_id)
 
     resp = await ac.get("/tickets", headers={"X-API-Key": "admin-bootstrap-key"})
     assert resp.status_code == 200
@@ -122,15 +169,17 @@ async def test_admin_client_list_tickets_shows_everyone(client):
 
 async def test_standard_client_cannot_read_another_clients_ticket_audit(client):
     ac, _ = client
-    ticket_id = await _seed_ticket("hr@example.com")
+    finance_id = await _client_id_for_key("finance-standard-key")
+    ticket_id = await _seed_ticket("hr@example.com", finance_id)
 
-    resp = await ac.get(f"/tickets/{ticket_id}/audit", headers={"X-API-Key": "finance-standard-key"})
+    resp = await ac.get(f"/tickets/{ticket_id}/audit", headers={"X-API-Key": "hr-standard-key"})
     assert resp.status_code == 404
 
 
 async def test_standard_client_can_read_its_own_ticket_audit(client):
     ac, _ = client
-    ticket_id = await _seed_ticket("hr@example.com")
+    hr_id = await _client_id_for_key("hr-standard-key")
+    ticket_id = await _seed_ticket("hr@example.com", hr_id)
 
     resp = await ac.get(f"/tickets/{ticket_id}/audit", headers={"X-API-Key": "hr-standard-key"})
     assert resp.status_code == 200
@@ -140,10 +189,17 @@ async def test_standard_client_approvals_list_scoped_to_own_tickets(client):
     ac, _ = client
     from app.db.models import Approval, Ticket, TicketStatus
 
+    hr_id = await _client_id_for_key("hr-standard-key")
+    finance_id = await _client_id_for_key("finance-standard-key")
+
     async with db_session_module.session_scope() as session:
-        hr_ticket = Ticket(requester="hr@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL)
+        hr_ticket = Ticket(
+            requester="hr@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL,
+            submitted_by_client_id=hr_id,
+        )
         finance_ticket = Ticket(
-            requester="finance@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL
+            requester="finance@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL,
+            submitted_by_client_id=finance_id,
         )
         session.add_all([hr_ticket, finance_ticket])
         await session.flush()
@@ -165,10 +221,17 @@ async def test_admin_client_approvals_list_sees_everything(client):
     ac, _ = client
     from app.db.models import Approval, Ticket, TicketStatus
 
+    hr_id = await _client_id_for_key("hr-standard-key")
+    finance_id = await _client_id_for_key("finance-standard-key")
+
     async with db_session_module.session_scope() as session:
-        hr_ticket = Ticket(requester="hr@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL)
+        hr_ticket = Ticket(
+            requester="hr@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL,
+            submitted_by_client_id=hr_id,
+        )
         finance_ticket = Ticket(
-            requester="finance@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL
+            requester="finance@example.com", subject="s", body="b", status=TicketStatus.AWAITING_APPROVAL,
+            submitted_by_client_id=finance_id,
         )
         session.add_all([hr_ticket, finance_ticket])
         await session.flush()

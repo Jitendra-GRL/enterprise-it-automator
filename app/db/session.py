@@ -3,6 +3,7 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlparse
 
+from sqlalchemy import inspect, text
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 
@@ -82,6 +83,36 @@ async def init_db() -> None:
             await conn.run_sync(Base.metadata.create_all)
     except IntegrityError:
         pass
+    await _ensure_tickets_submitted_by_client_id_column(engine)
+
+
+async def _ensure_tickets_submitted_by_client_id_column(engine) -> None:
+    """create_all (above) only creates MISSING TABLES — it never alters an
+    EXISTING table to add a newly-modeled column, so a column added to
+    Ticket after the tickets table already exists on a live database (as
+    happened here) needs an explicit, self-healing ADD COLUMN step, or
+    every read/write referencing it crashes with "column does not exist"
+    the moment this deploys against an already-provisioned database.
+
+    Dialect-agnostic (checks via SQLAlchemy's inspector rather than a raw
+    "ALTER TABLE ... ADD COLUMN IF NOT EXISTS", whose syntax/support
+    differs between SQLite and Postgres) and safe to call on every
+    startup, on both a fresh database (table doesn't exist yet — collected
+    the column list, add_column short-circuits false) and an
+    already-migrated one (column already present — no-op).
+    """
+    def _has_column(sync_conn) -> bool:
+        inspector = inspect(sync_conn)
+        if "tickets" not in inspector.get_table_names():
+            return True  # table doesn't exist yet — create_all above just made it correctly
+        columns = {c["name"] for c in inspector.get_columns("tickets")}
+        return "submitted_by_client_id" in columns
+
+    async with engine.begin() as conn:
+        already_present = await conn.run_sync(_has_column)
+        if already_present:
+            return
+        await conn.execute(text("ALTER TABLE tickets ADD COLUMN submitted_by_client_id INTEGER"))
 
 
 @asynccontextmanager

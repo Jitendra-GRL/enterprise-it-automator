@@ -284,6 +284,7 @@ async def submit_ticket(
             subject=payload.subject,
             body=payload.body,
             status=TicketStatus.PLANNING,
+            submitted_by_client_id=client.id if client is not None else None,
         )
         session.add(ticket)
         await session.flush()
@@ -321,6 +322,7 @@ async def submit_ticket_stream(
             subject=payload.subject,
             body=payload.body,
             status=TicketStatus.PLANNING,
+            submitted_by_client_id=client.id if client is not None else None,
         )
         session.add(ticket)
         await session.flush()
@@ -342,14 +344,26 @@ def _client_may_see_ticket(client: ApiClient | None, ticket: Ticket) -> bool:
     approvals/audit entries). None (API_KEY unset, local demo mode) and
     ADMIN clients see everything, matching this app's pre-existing
     behavior for a small-team ops setup. A STANDARD client may only see
-    tickets they themselves filed — closes a security-review finding: the
+    tickets it itself submitted — closes a security-review finding: the
     single shared API key previously meant "may submit tickets" was
     indistinguishable from "may read every employee's audit trail/access
     history company-wide," since these reads had no caller-scoping at all.
+
+    Scoped by Ticket.submitted_by_client_id (who actually authenticated the
+    POST /tickets call), NOT Ticket.requester — requester is free-text the
+    caller puts in the request BODY, entirely decoupled from which
+    credential made the call. An earlier version of this compared
+    `ticket.requester == client.name`, which broke both directions on a
+    live public demo: a caller submitting with a `requester` value that
+    didn't happen to equal their own ApiClient's `name` (e.g. the demo
+    client, literally named "public-demo-guest") couldn't see their OWN
+    just-submitted ticket, and nothing stopped a DIFFERENT caller from
+    seeing someone else's ticket by guessing/matching the right requester
+    string instead. See Ticket.submitted_by_client_id's docstring.
     """
     if client is None or client.role == ApiClientRole.ADMIN:
         return True
-    return ticket.requester == client.name
+    return ticket.submitted_by_client_id == client.id
 
 
 @app.get("/tickets", response_model=list[TicketOut])
@@ -357,7 +371,7 @@ async def list_tickets(client: ApiClient | None = Depends(require_api_client)) -
     async with session_scope() as session:
         query = select(Ticket).order_by(Ticket.created_at.desc())
         if client is not None and client.role != ApiClientRole.ADMIN:
-            query = query.where(Ticket.requester == client.name)
+            query = query.where(Ticket.submitted_by_client_id == client.id)
         rows = await session.scalars(query)
         return list(rows)
 
@@ -407,7 +421,9 @@ async def list_approvals(
             except ValueError:
                 raise HTTPException(400, f"Invalid status: {status!r}")
         if client is not None and client.role != ApiClientRole.ADMIN:
-            query = query.join(Ticket, Approval.ticket_id == Ticket.id).where(Ticket.requester == client.name)
+            query = query.join(Ticket, Approval.ticket_id == Ticket.id).where(
+                Ticket.submitted_by_client_id == client.id
+            )
         rows = await session.scalars(query)
         return list(rows)
 
