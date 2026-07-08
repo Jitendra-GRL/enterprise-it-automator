@@ -3,6 +3,7 @@
 [![CI](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/ci.yml/badge.svg)](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/ci.yml)
 [![Build and Push Image](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/deploy.yml/badge.svg)](https://github.com/JitendraPrabhu-l/enterprise-it-automator/actions/workflows/deploy.yml)
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+[![Live demo](https://img.shields.io/website?url=https%3A%2F%2Fenterprise-it-automator.onrender.com%2Fhealth&up_message=online&down_message=asleep&label=live%20demo)](https://enterprise-it-automator.onrender.com/)
 
 A multi-agent-style IT automation system that processes employee onboarding/offboarding
 tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
@@ -11,7 +12,7 @@ tickets by reasoning over a custom **Model Context Protocol (MCP)** server, with
 **Live demo:** [enterprise-it-automator.onrender.com](https://enterprise-it-automator.onrender.com/)
 — the dashboard auto-fills a public, low-privilege demo key so you can submit a ticket
 without asking for a credential (may take ~30–60s to wake up on the free tier's first
-request after idling).
+request after idling — the badge above will read "asleep" until then).
 
 ![Dashboard screenshot](docs/dashboard-screenshot.png)
 
