@@ -192,9 +192,6 @@ const apiKeyInput = document.getElementById("apiKeyInput");
 apiKeyInput.value = localStorage.getItem("apiKey") || "";
 apiKeyInput.addEventListener("input", () => {
   localStorage.setItem("apiKey", apiKeyInput.value);
-  // Once a visitor types their own key, stop treating this browser as
-  // "on the public demo key" — see autoFillDemoKeyIfAvailable below.
-  localStorage.setItem("apiKeyManuallySet", "1");
   updateDemoModeBanner();
 });
 
@@ -202,8 +199,6 @@ const reviewerInput = document.getElementById("reviewerInput");
 reviewerInput.value = localStorage.getItem("reviewerToken") || "";
 reviewerInput.addEventListener("input", () => {
   localStorage.setItem("reviewerToken", reviewerInput.value);
-  // Same manual-override guard as apiKeyInput above, for the reviewer token.
-  localStorage.setItem("reviewerTokenManuallySet", "1");
   updateDemoModeBanner();
 });
 
@@ -221,18 +216,30 @@ function updateDemoModeBanner() {
 async function autoFillDemoKeyIfAvailable() {
   // Public portfolio deployments can opt into DEMO_API_KEY (see
   // app/config.py) so a stranger can try the app without asking for a real
-  // credential first. Only auto-fills if this browser has never had a
-  // value typed into it manually — a visitor who pastes in their own real
-  // key/token must never have it silently overwritten by a later page load.
+  // credential first. Only auto-fills a field that is CURRENTLY empty — a
+  // visitor who has their own real key/token sitting in the field (typed
+  // this visit, or restored from localStorage on page load above) must
+  // never have it silently overwritten.
+  //
+  // Deliberately keyed off the input's live value, not a sticky
+  // "manually set" localStorage flag from a previous visit — an earlier
+  // version of this used such a flag, which meant a visitor who typed a
+  // key, then later cleared just the apiKey value (but not the flag, e.g.
+  // by editing localStorage by hand, or across an app update that changed
+  // what gets cleared) would have BOTH fields stuck permanently un-fillable
+  // even with an empty box in front of them. Reproduced live: the reviewer
+  // token (a brand-new field with no such stale flag yet) auto-filled fine
+  // while the API key (carrying old apiKeyManuallySet state from months of
+  // earlier testing in this exact browser) silently didn't.
   try {
     const res = await fetch("/demo-key");
     const data = await res.json();
     knownDemoApiKey = data.api_key || null;
-    if (data.api_key && !apiKeyInput.value && !localStorage.getItem("apiKeyManuallySet")) {
+    if (data.api_key && !apiKeyInput.value) {
       apiKeyInput.value = data.api_key;
       localStorage.setItem("apiKey", data.api_key);
     }
-    if (data.reviewer_token && !reviewerInput.value && !localStorage.getItem("reviewerTokenManuallySet")) {
+    if (data.reviewer_token && !reviewerInput.value) {
       reviewerInput.value = data.reviewer_token;
       localStorage.setItem("reviewerToken", data.reviewer_token);
     }
