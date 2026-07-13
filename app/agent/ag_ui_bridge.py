@@ -56,6 +56,7 @@ from ag_ui.core import (
     ToolCallStartEvent,
 )
 
+from app.agent import token_budget
 from app.agent.mcp_session_cache import ticket_run_session
 
 logger = logging.getLogger(__name__)
@@ -144,6 +145,15 @@ async def _stream_graph_run(
     graph = await _get_graph()
     config = _thread_config(ticket_id)
 
+    # Same per-ticket token accounting as runner.py's non-streaming paths:
+    # fresh runs start at 0; resumes seed from the checkpointed spend so an
+    # approval-resume never grants a fresh budget.
+    if isinstance(graph_input, dict):
+        token_budget.start_accounting(0)
+    else:
+        snapshot = await graph.aget_state(config)
+        token_budget.start_accounting((snapshot.values or {}).get("tokens_used", 0))
+
     yield RunStartedEvent(thread_id=f"ticket-{ticket_id}", run_id=run_id)
 
     try:
@@ -160,7 +170,7 @@ async def _stream_graph_run(
                             yield StateDeltaEvent(delta=[op])
                     yield StepFinishedEvent(step_name=node_name)
     except Exception as exc:
-        leaf = exc
+        leaf: BaseException = exc
         while isinstance(leaf, BaseExceptionGroup) and leaf.exceptions:
             leaf = leaf.exceptions[0]
         logger.exception("Graph run failed for ticket %s during AG-UI stream", ticket_id)
@@ -207,6 +217,7 @@ async def stream_ticket_run(ticket_id: int, ticket_text: str, run_id: str) -> As
         "done": False,
         "error": None,
         "replan_count": 0,
+        "tokens_used": 0,
     }
     async for event in _stream_graph_run(ticket_id, run_id, initial_state):
         yield event

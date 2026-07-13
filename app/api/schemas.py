@@ -52,6 +52,11 @@ class ApprovalOut(BaseModel):
     reasoning: str
     status: str
     reviewer: str
+    # Decision provenance (None while PENDING and for rows decided before
+    # these columns existed): "token" | "oidc" | "telegram", plus the IdP's
+    # immutable `sub` identifier when the decision came via OIDC.
+    reviewer_auth_method: str | None = None
+    reviewer_oidc_subject: str | None = None
     created_at: datetime
     resolved_at: datetime | None
 
@@ -92,6 +97,11 @@ class RunResult(BaseModel):
 class SlaSweepResult(BaseModel):
     escalated_approvals: list[int]
     stuck_tickets: list[int]
+    # True when this replica skipped the pass because another replica held
+    # the cross-replica sweep lock (see app/agent/sla_sweep.py) — the sweep
+    # still happened cluster-wide, just not here. Defaults False so
+    # pre-existing clients/tests see an unchanged shape.
+    skipped: bool = False
 
 
 class DemoResetResult(BaseModel):

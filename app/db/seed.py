@@ -1,12 +1,16 @@
 import asyncio
 import secrets
+from typing import Any
 
 from sqlalchemy import select
 
 from app.db.models import ApiClient, ApiClientRole, EmployeeUser, Reviewer, ReviewerRole, UserStatus
 from app.db.session import init_db, session_scope
 
-SEED_USERS = [
+# Explicitly dict[str, Any]: these are **kwargs bundles for heterogeneous
+# model constructors — without the annotation, mypy infers a narrower value
+# type per list and then rejects the shared `row` loop variable in seed().
+SEED_USERS: list[dict[str, Any]] = [
     dict(
         username="jsmith",
         full_name="Jane Smith",
@@ -35,7 +39,7 @@ SEED_USERS = [
 # require_reviewer_token) — this is what actually proves a caller IS that
 # reviewer, rather than the username alone, which is just a claim anyone
 # holding the shared API key could type into a request.
-SEED_REVIEWER_USERNAMES = [
+SEED_REVIEWER_USERNAMES: list[dict[str, Any]] = [
     dict(username="mchen", role=ReviewerRole.MANAGER),
     dict(username="admin", role=ReviewerRole.IT_ADMIN),
 ]
@@ -48,7 +52,7 @@ SEED_REVIEWER_USERNAMES = [
 # app/api/main.py's lifespan creates from API_KEY) can. Not seeded with a
 # fixed key — a fresh random one is generated and printed, same as
 # reviewer tokens below.
-SEED_STANDARD_API_CLIENTS = [
+SEED_STANDARD_API_CLIENTS: list[dict[str, Any]] = [
     dict(name="hr@example.com", role=ApiClientRole.STANDARD, daily_request_limit=100),
 ]
 

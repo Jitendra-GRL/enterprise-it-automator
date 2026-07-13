@@ -54,9 +54,31 @@ services:
       - key: TELEGRAM_WEBHOOK_SECRET
         sync: false
 
+      # Optional: lets a reviewer get a plain email when an approval needs
+      # their decision, instead of only the dashboard/Telegram — see
+      # .env.example's SMTP_HOST comment and DEPLOYMENT.md's Step 8. Leave
+      # blank/unset entirely to disable this feature.
+      - key: SMTP_HOST
+        sync: false
+      - key: SMTP_PORT
+        sync: false
+      - key: SMTP_USERNAME
+        sync: false
+      - key: SMTP_PASSWORD
+        sync: false
+      - key: SMTP_FROM_ADDRESS
+        sync: false
+
       # --- Non-secret config, safe to commit ---
       - key: LLM_PROVIDER
         value: groq
+      # 70b, not the code-default 8b: the live golden-ticket eval measured
+      # 8b at 3/6 (hallucinated tool name, category misses) vs 70b at 5/6
+      # (2026-07-13, `python -m evals.run_live`) — see README's "Notes on
+      # model choice". If this org ever loses 70b access, drop back to
+      # llama-3.1-8b-instant and expect degraded planning quality.
+      - key: GROQ_MODEL
+        value: llama-3.3-70b-versatile
       - key: SENSITIVE_ACTIONS
         value: disable_user,enable_user,revoke_access,create_user,grant_access
       - key: APPROVAL_SLA_MINUTES

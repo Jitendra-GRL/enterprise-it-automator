@@ -16,15 +16,30 @@ migration, it's just backed by a real row instead of a bare string compare.
 """
 
 import logging
+from dataclasses import dataclass
 
 from fastapi import Header, HTTPException
 from sqlalchemy import select
 
+from app.api.oidc import OIDCVerificationError, verify_oidc_token
 from app.config import get_settings
 from app.db.models import ApiClient, Reviewer
 from app.db.session import session_scope
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class AuthenticatedReviewer:
+    """A reviewer plus HOW they authenticated — the provenance half is what
+    the approvals table records (reviewer_auth_method/reviewer_oidc_subject
+    columns), so an auditor can distinguish 'the IdP vouched for this
+    person' from 'someone presented this reviewer's shared secret.'
+    """
+
+    reviewer: Reviewer
+    auth_method: str  # "token" | "oidc"
+    oidc_subject: str | None = None
 
 
 async def require_api_client(x_api_key: str | None = Header(default=None)) -> ApiClient | None:
@@ -72,3 +87,56 @@ async def require_reviewer_token(x_reviewer_token: str | None = Header(default=N
     if reviewer is None:
         raise HTTPException(401, "Invalid reviewer token.")
     return reviewer
+
+
+async def require_reviewer(
+    x_reviewer_token: str | None = Header(default=None),
+    authorization: str | None = Header(default=None),
+) -> AuthenticatedReviewer:
+    """Authenticates the caller as a reviewer via EITHER path:
+
+    - `Authorization: Bearer <OIDC JWT>` — only honored when OIDC is
+      configured (Settings.oidc_enabled); the token is fully verified
+      against the IdP's published keys (app/api/oidc.py), then its username
+      claim must match a registered Reviewer row. IdP-verified identity, no
+      local secret involved.
+    - `X-Reviewer-Token` — the original per-reviewer shared secret,
+      unchanged. Still the only path when OIDC is not configured, and still
+      accepted when it is (a migration period where some reviewers use SSO
+      and some haven't onboarded yet is the normal enterprise rollout shape,
+      and killing the old path is a one-line change — delete this fallback —
+      once a deployment decides to).
+
+    Precedence: a presented Bearer token is verified and is AUTHORITATIVE —
+    if it fails verification the request is rejected even if a valid
+    X-Reviewer-Token accompanies it. Silently falling back from a bad JWT
+    to a weaker credential would let an attacker with a stolen reviewer
+    token mask it behind an expired-JWT smokescreen in the logs.
+    """
+    settings = get_settings()
+    if settings.oidc_enabled and authorization and authorization.lower().startswith("bearer "):
+        token = authorization[7:].strip()
+        try:
+            claims = await verify_oidc_token(token)
+        except OIDCVerificationError as exc:
+            logger.warning("OIDC bearer token rejected: %s", exc)
+            raise HTTPException(401, "OIDC bearer token rejected.") from exc
+        username = claims.get(settings.oidc_username_claim)
+        if not username:
+            raise HTTPException(
+                401,
+                f"OIDC token verified but has no {settings.oidc_username_claim!r} claim "
+                "to match against a registered reviewer.",
+            )
+        async with session_scope() as session:
+            reviewer = await session.scalar(select(Reviewer).where(Reviewer.username == username))
+        if reviewer is None:
+            # 403, not 401: authentication SUCCEEDED (the IdP vouched for
+            # this person) — they're just not authorized to review here.
+            raise HTTPException(403, f"{username!r} is not a registered reviewer.")
+        return AuthenticatedReviewer(
+            reviewer=reviewer, auth_method="oidc", oidc_subject=claims.get("sub")
+        )
+
+    reviewer = await require_reviewer_token(x_reviewer_token)
+    return AuthenticatedReviewer(reviewer=reviewer, auth_method="token")

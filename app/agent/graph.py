@@ -53,6 +53,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langgraph.graph import END, StateGraph
 from langgraph.types import RetryPolicy, Send, interrupt
 
+from app import metrics
+from app.agent import token_budget
 from app.agent.llm import get_llm
 from app.agent.mcp_client import call_tool, is_transient_error, list_tools, mcp_session
 from app.agent.mcp_session_cache import get_cached_proxy
@@ -60,7 +62,7 @@ from app.agent.prompts.access_change import ACCESS_CHANGE_PLANNER_PROMPT
 from app.agent.prompts.common import PROMPT_INJECTION_GUARDRAIL
 from app.agent.prompts.offboarding import OFFBOARDING_PLANNER_PROMPT
 from app.agent.prompts.onboarding import ONBOARDING_PLANNER_PROMPT
-from app.agent.state import AgentState, BatchStepInput
+from app.agent.state import AgentState, BatchStepInput, StepResult
 from app.config import get_settings
 from app.db.session import session_scope
 from app.mcp_server.approval_gate import find_approved
@@ -144,7 +146,10 @@ ONBOARDING, OFFBOARDING, or ACCESS_CHANGE. If genuinely ambiguous, prefer ACCESS
 
 TicketCategory = Literal["ONBOARDING", "OFFBOARDING", "ACCESS_CHANGE"]
 
-CATEGORY_PROMPTS: dict[TicketCategory, str] = {
+# Keyed by TicketCategory values but typed dict[str, str]: every lookup site
+# feeds it category strings from (checkpointed) AgentState, which typing
+# can't prove are the Literal — the runtime .get(..., default) is the guard.
+CATEGORY_PROMPTS: dict[str, str] = {
     "ONBOARDING": ONBOARDING_PLANNER_PROMPT,
     "OFFBOARDING": OFFBOARDING_PLANNER_PROMPT,
     "ACCESS_CHANGE": ACCESS_CHANGE_PLANNER_PROMPT,
@@ -460,7 +465,26 @@ def route_after_classify(state: AgentState) -> str:
     return "plan"
 
 
+def _budget_exhausted_update(state: AgentState) -> dict:
+    """The shared refuse-to-plan-further update for plan/replan when the
+    ticket's token budget is spent: an explicit FAILED path through
+    finalize, plus the ticket_token_budget_exceeded_total counter — never a
+    silent continuation that keeps spending.
+    """
+    message = token_budget.budget_error_message(state["ticket_id"])
+    logger.warning(message)
+    metrics.TICKET_TOKEN_BUDGET_EXCEEDED.inc()
+    return {
+        "error": message,
+        "done": True,
+        "tokens_used": token_budget.current_total() or state.get("tokens_used", 0),
+    }
+
+
 async def plan_node(state: AgentState) -> dict:
+    if token_budget.budget_exceeded():
+        return _budget_exhausted_update(state)
+
     llm = get_llm()
 
     username = await _extract_username(llm, state["ticket_text"])
@@ -486,6 +510,7 @@ async def plan_node(state: AgentState) -> dict:
     record_llm_call("plan", _llm_model_name(), response)
     raw = response.content if isinstance(response.content, str) else str(response.content)
 
+    tokens_used = token_budget.current_total() or state.get("tokens_used", 0)
     try:
         steps = _extract_json_array(raw)
     except (ValueError, json.JSONDecodeError) as exc:
@@ -496,12 +521,14 @@ async def plan_node(state: AgentState) -> dict:
             "error": f"Planner returned malformed JSON: {exc}",
             "done": True,
             "messages": [AIMessage(content=raw)],
+            "tokens_used": tokens_used,
         }
 
     return {
         "plan": steps,
         "plan_index": 0,
         "messages": [AIMessage(content=raw)],
+        "tokens_used": tokens_used,
     }
 
 
@@ -555,20 +582,22 @@ def route_after_step_check(state: AgentState):
 
 
 async def _notify_reviewers_if_configured(approval_id: int) -> None:
-    """Pushes a Telegram notification (with inline Approve/Reject buttons) to
-    every reviewer entitled to decide this approval who has linked a
-    Telegram chat — see app/notifications/telegram.py's module docstring
-    for the full linking/security model. A no-op with TELEGRAM_BOT_TOKEN
-    unset, and best-effort even when configured: a notification failure
-    must never fail the ticket run itself, since the dashboard remains a
-    fully functional path to decide this same approval regardless.
+    """Pushes notifications (Telegram, with inline Approve/Reject buttons,
+    and/or plain email) to every reviewer entitled to decide this approval
+    who has linked/configured that channel — see
+    app/notifications/telegram.py and app/notifications/email.py's module
+    docstrings for the full linking/security model of each. A no-op for
+    whichever channel(s) are left unconfigured, and best-effort even when
+    configured: a notification failure must never fail the ticket run
+    itself, since the dashboard remains a fully functional path to decide
+    this same approval regardless.
     """
-    if not get_settings().telegram_bot_token:
+    settings = get_settings()
+    if not settings.telegram_bot_token and not settings.smtp_host:
         return
 
     from app.api.rbac import find_entitled_reviewers
     from app.db.models import Approval
-    from app.notifications.telegram import notify_reviewers_of_pending_approval
 
     try:
         async with session_scope() as session:
@@ -576,9 +605,24 @@ async def _notify_reviewers_if_configured(approval_id: int) -> None:
             if approval is None:
                 return
             reviewers = await find_entitled_reviewers(session, approval)
-            await notify_reviewers_of_pending_approval(session, approval, reviewers)
+
+            if settings.telegram_bot_token:
+                from app.notifications.telegram import notify_reviewers_of_pending_approval as notify_telegram
+
+                try:
+                    await notify_telegram(session, approval, reviewers)
+                except Exception:
+                    logger.exception("Failed to notify reviewers via Telegram for approval %d", approval_id)
+
+            if settings.smtp_host:
+                from app.notifications.email import notify_reviewers_of_pending_approval as notify_email
+
+                try:
+                    await notify_email(approval, reviewers)
+                except Exception:
+                    logger.exception("Failed to notify reviewers via email for approval %d", approval_id)
     except Exception:
-        logger.exception("Failed to notify reviewers via Telegram for approval %d", approval_id)
+        logger.exception("Failed to notify reviewers for approval %d", approval_id)
 
 
 async def await_approval_node(state: AgentState) -> dict:
@@ -752,6 +796,9 @@ async def replan_node(state: AgentState) -> dict:
     or re-conflicting with them. Replaces the remaining plan starting at the
     current position; already-executed steps and their results are kept.
     """
+    if token_budget.budget_exceeded():
+        return _budget_exhausted_update(state)
+
     llm = get_llm()
     results = state.get("results", [])
     progress_lines = [
@@ -787,6 +834,7 @@ async def replan_node(state: AgentState) -> dict:
     record_llm_call("replan", _llm_model_name(), response)
     raw = response.content if isinstance(response.content, str) else str(response.content)
 
+    tokens_used = token_budget.current_total() or state.get("tokens_used", 0)
     try:
         new_remaining_steps = _extract_json_array(raw)
     except (ValueError, json.JSONDecodeError) as exc:
@@ -795,6 +843,7 @@ async def replan_node(state: AgentState) -> dict:
             "error": f"Replanner returned malformed JSON: {exc}",
             "done": True,
             "messages": [AIMessage(content=raw)],
+            "tokens_used": tokens_used,
         }
 
     already_executed = state["plan"][: state["plan_index"]]
@@ -803,6 +852,7 @@ async def replan_node(state: AgentState) -> dict:
         "plan_index": state["plan_index"],
         "replan_count": state.get("replan_count", 0) + 1,
         "messages": [AIMessage(content=raw)],
+        "tokens_used": tokens_used,
     }
 
 
@@ -851,7 +901,7 @@ _REQUIRED_ACTION_BY_CATEGORY = {
 }
 
 
-def _required_action_missing(category: str, results: list[dict]) -> bool:
+def _required_action_missing(category: str, results: list[StepResult]) -> bool:
     required = _REQUIRED_ACTION_BY_CATEGORY.get(category)
     if required is None:
         return False
@@ -915,6 +965,7 @@ async def finalize_node(state: AgentState) -> dict:
             ticket.status = status
             ticket.result_summary = summary
 
+    metrics.TICKETS_FINALIZED.labels(status=status.value).inc()
     return {"done": True}
 
 

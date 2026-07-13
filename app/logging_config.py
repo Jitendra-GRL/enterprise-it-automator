@@ -18,7 +18,9 @@ from datetime import datetime, timezone
 _request_id: contextvars.ContextVar[str | None] = contextvars.ContextVar("request_id", default=None)
 
 
-def set_request_id(request_id: str) -> None:
+def set_request_id(request_id: str | None) -> None:
+    """None clears the id at request end (the middleware's teardown call) —
+    matching the contextvar's own str | None shape."""
     _request_id.set(request_id)
 
 

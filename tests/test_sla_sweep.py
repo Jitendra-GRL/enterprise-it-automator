@@ -210,4 +210,4 @@ async def test_run_sla_sweep_combines_both_checks(isolated_db):
         )
 
     result = await run_sla_sweep()
-    assert result == {"escalated_approvals": [1], "stuck_tickets": [2]}
+    assert result == {"escalated_approvals": [1], "stuck_tickets": [2], "skipped": False}

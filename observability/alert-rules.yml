@@ -1,0 +1,67 @@
+# Alert rules over app/metrics.py's series. Each rule's annotation says
+# what to DO, not just what happened — the on-call action lives in
+# docs/RUNBOOKS.md under the alert's name.
+groups:
+  - name: it-automator
+    rules:
+      - alert: HighHttpErrorRate
+        expr: |
+          sum(rate(http_requests_total{status=~"5.."}[5m]))
+            / clamp_min(sum(rate(http_requests_total[5m])), 1e-10) > 0.05
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: ">5% of HTTP requests are 5xx for 5m"
+          runbook: docs/RUNBOOKS.md#highhttperrorrate
+
+      - alert: ApprovalsPendingPileup
+        expr: approvals_pending > 10
+        for: 30m
+        labels:
+          severity: warn
+        annotations:
+          summary: "{{ $value }} approvals pending for 30m+ — reviewers may be unaware (check notifications) or SLA sweep is stalled"
+          runbook: docs/RUNBOOKS.md#approvalspendingpileup
+
+      - alert: ApprovalEscalations
+        expr: increase(approvals_escalated_total[1h]) > 0
+        labels:
+          severity: warn
+        annotations:
+          summary: "Approvals breached their SLA and were escalated in the last hour"
+          runbook: docs/RUNBOOKS.md#approvalescalations
+
+      - alert: CircuitBreakerOpen
+        expr: max by (domain) (mcp_circuit_breaker_open) == 1
+        for: 5m
+        labels:
+          severity: page
+        annotations:
+          summary: "MCP domain {{ $labels.domain }} circuit breaker open for 5m — backend down or misbehaving"
+          runbook: docs/RUNBOOKS.md#circuitbreakeropen
+
+      - alert: StuckTicketsDetected
+        expr: increase(stuck_tickets_failed_total[1h]) > 0
+        labels:
+          severity: warn
+        annotations:
+          summary: "Tickets were stuck mid-run and failed by the sweep — check for crashes/restarts mid-run"
+          runbook: docs/RUNBOOKS.md#stuckticketsdetected
+
+      - alert: TokenBudgetAborts
+        expr: increase(ticket_token_budget_exceeded_total[1h]) > 0
+        labels:
+          severity: warn
+        annotations:
+          summary: "Ticket runs aborted on MAX_TOKENS_PER_TICKET — a replanning loop or an undersized budget"
+          runbook: docs/RUNBOOKS.md#tokenbudgetaborts
+
+      - alert: ApiDown
+        expr: up{job="it-automator-api"} == 0
+        for: 2m
+        labels:
+          severity: page
+        annotations:
+          summary: "API /metrics unscrapable for 2m — app down or wedged"
+          runbook: docs/RUNBOOKS.md#apidown

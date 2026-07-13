@@ -122,6 +122,15 @@ class Reviewer(Base):
     # as before this feature existed. Unique so one Telegram account can't
     # accidentally end up linked to two reviewers at once.
     telegram_chat_id: Mapped[str | None] = mapped_column(String(64), unique=True, index=True, nullable=True)
+    # Set once, out-of-band (an admin/seed script, not any web form this app
+    # exposes), when a reviewer wants plain email notifications for approvals
+    # they're entitled to decide (see app/notifications/email.py). Nullable
+    # and unenforced-unique deliberately: unlike telegram_chat_id, there's no
+    # verification step proving the reviewer controls this address, so it's
+    # purely a "where to send a courtesy notification" field, never itself an
+    # auth credential — deciding an approval always still requires the real
+    # X-Reviewer-Token, exactly as before this field existed.
+    email: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -258,6 +267,14 @@ class Approval(Base):
         Enum(ApprovalStatus), default=ApprovalStatus.PENDING
     )
     reviewer: Mapped[str] = mapped_column(String(128), default="")
+    # HOW the deciding reviewer authenticated ("token" = per-reviewer shared
+    # secret, "oidc" = IdP-verified JWT) and, for OIDC, the IdP's immutable
+    # `sub` identifier — provenance that turns "someone presented mchen's
+    # token" and "the IdP vouched this was mchen" into distinguishable
+    # audit facts. Nullable: rows decided before these columns existed, and
+    # rows still PENDING, legitimately have neither.
+    reviewer_auth_method: Mapped[str | None] = mapped_column(String(16), nullable=True)
+    reviewer_oidc_subject: Mapped[str | None] = mapped_column(String(128), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     resolved_at: Mapped[datetime | None] = mapped_column(
         DateTime(timezone=True), nullable=True

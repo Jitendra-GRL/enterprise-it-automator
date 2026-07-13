@@ -17,6 +17,7 @@ OpenRouter instead of OpenAI.
 from functools import lru_cache
 
 from langchain_core.language_models import BaseChatModel
+from pydantic import SecretStr
 
 from app.config import get_settings
 
@@ -32,7 +33,7 @@ def _build_groq() -> BaseChatModel:
         )
     return ChatGroq(
         model=settings.groq_model,
-        api_key=settings.groq_api_key,
+        api_key=SecretStr(settings.groq_api_key),
         temperature=0,
     )
 
@@ -43,10 +44,15 @@ def _build_anthropic() -> BaseChatModel:
     settings = get_settings()
     if not settings.anthropic_api_key:
         raise RuntimeError("LLM_PROVIDER=anthropic but ANTHROPIC_API_KEY is not set.")
+    # model_name= is the field's real name (model= is its runtime alias,
+    # which mypy can't see); timeout/stop are required by the type stubs
+    # despite having working runtime defaults.
     return ChatAnthropic(
-        model=settings.anthropic_model,
-        api_key=settings.anthropic_api_key,
+        model_name=settings.anthropic_model,
+        api_key=SecretStr(settings.anthropic_api_key),
         temperature=0,
+        timeout=None,
+        stop=None,
     )
 
 
@@ -60,8 +66,8 @@ def _build_watsonx() -> BaseChatModel:
         )
     return ChatWatsonx(
         model_id=settings.watsonx_model,
-        url=settings.watsonx_url,
-        apikey=settings.watsonx_api_key,
+        url=SecretStr(settings.watsonx_url),
+        apikey=SecretStr(settings.watsonx_api_key),
         project_id=settings.watsonx_project_id,
         params={"temperature": 0},
     )
@@ -78,7 +84,7 @@ def _build_openrouter() -> BaseChatModel:
         )
     return ChatOpenAI(
         model=settings.openrouter_model,
-        api_key=settings.openrouter_api_key,
+        api_key=SecretStr(settings.openrouter_api_key),
         base_url=settings.openrouter_base_url,
         temperature=0,
     )

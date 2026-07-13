@@ -29,10 +29,19 @@ dependencies = [
     "opentelemetry-sdk>=1.29.0",
     "opentelemetry-exporter-otlp-proto-http>=1.29.0",
     "ag-ui-protocol>=0.1.19",
+    "prometheus-client>=0.25.0",
+    "PyJWT[crypto]>=2.10.0",
+    "alembic>=1.16.0",
 ]
 
 [project.optional-dependencies]
-dev = ["pytest>=8.3.4", "pytest-asyncio>=0.25.1", "ruff>=0.15.0"]
+dev = [
+    "pytest>=8.3.4",
+    "pytest-asyncio>=0.25.1",
+    "pytest-cov>=7.0.0",
+    "ruff>=0.15.0",
+    "mypy>=1.14.0",
+]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
@@ -44,3 +53,27 @@ target-version = "py311"
 
 [tool.ruff.lint]
 select = ["F"]
+
+[tool.mypy]
+# Enforced in CI (ci.yml) over app/ — the full production package typechecks
+# clean. Tests are excluded deliberately: their heavy monkeypatching of
+# module attributes is idiomatic pytest but type-opaque, and typing them
+# would add noise, not safety. python_version matches CI/the Docker image
+# (3.13) — 3.11 would be truer to requires-python but modern dependency
+# stubs (numpy) already use 3.12+ `type` statements.
+python_version = "3.13"
+files = ["app"]
+ignore_missing_imports = true
+warn_redundant_casts = true
+warn_unused_ignores = true
+warn_unreachable = true
+no_implicit_optional = true
+
+[tool.coverage.run]
+source = ["app"]
+
+[tool.coverage.report]
+show_missing = false
+# Floor set from the measured baseline (see ci.yml's coverage step) — raise
+# it as coverage grows; never lower it to make a PR pass.
+fail_under = 80

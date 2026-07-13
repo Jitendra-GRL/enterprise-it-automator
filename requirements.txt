@@ -28,5 +28,12 @@ opentelemetry-api>=1.29.0
 opentelemetry-sdk>=1.29.0
 opentelemetry-exporter-otlp-proto-http>=1.29.0
 ag-ui-protocol>=0.1.19
+prometheus-client>=0.25.0
+# App code imports jwt directly (app/api/oidc.py) — pinned explicitly even
+# though mcp already pulls it in transitively; [crypto] guarantees the RS256
+# backend (cryptography) is present.
+PyJWT[crypto]>=2.10.0
+alembic>=1.16.0
 pytest>=8.3.4
 pytest-asyncio>=0.25.1
+pytest-cov>=7.0.0

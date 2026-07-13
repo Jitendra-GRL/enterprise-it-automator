@@ -1,0 +1,60 @@
+# Observability add-on: Prometheus (metrics + alert rules), Alertmanager
+# (routing), Grafana (provisioned datasource + dashboard). An OVERLAY on the
+# base compose file, so the default `docker compose up` stays exactly as it
+# was — opt in with:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+#
+# Then: Grafana http://localhost:3000 (admin / $GRAFANA_ADMIN_PASSWORD),
+# Prometheus http://localhost:9090, Alertmanager http://localhost:9093.
+#
+# Tracing note: this stack covers the METRICS signal (app/metrics.py). The
+# tracing signal (app/observability.py) exports OTLP to whatever
+# OTEL_EXPORTER_OTLP_ENDPOINT points at (Jaeger, Langfuse, a collector) and
+# is deliberately not bundled here — pick the trace backend per deployment.
+
+services:
+  prometheus:
+    image: prom/prometheus:v3.4.1
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.retention.time=15d
+    volumes:
+      - ./observability/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - ./observability/alert-rules.yml:/etc/prometheus/alert-rules.yml:ro
+      - prometheus_data:/prometheus
+    ports:
+      - "9090:9090"
+    restart: unless-stopped
+
+  alertmanager:
+    image: prom/alertmanager:v0.28.1
+    command:
+      - --config.file=/etc/alertmanager/alertmanager.yml
+    volumes:
+      - ./observability/alertmanager.yml:/etc/alertmanager/alertmanager.yml:ro
+      - alertmanager_data:/alertmanager
+    ports:
+      - "9093:9093"
+    restart: unless-stopped
+
+  grafana:
+    image: grafana/grafana:11.6.1
+    environment:
+      GF_SECURITY_ADMIN_USER: admin
+      GF_SECURITY_ADMIN_PASSWORD: ${GRAFANA_ADMIN_PASSWORD:?GRAFANA_ADMIN_PASSWORD must be set — no insecure default}
+      GF_USERS_ALLOW_SIGN_UP: "false"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana_data:/var/lib/grafana
+    ports:
+      - "3000:3000"
+    depends_on:
+      - prometheus
+    restart: unless-stopped
+
+volumes:
+  prometheus_data:
+  alertmanager_data:
+  grafana_data:

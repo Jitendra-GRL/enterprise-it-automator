@@ -20,6 +20,8 @@ from typing import Any, TypeVar
 
 from opentelemetry import trace
 from opentelemetry.exporter.otlp.proto.http.trace_exporter import OTLPSpanExporter
+
+from app import metrics
 from opentelemetry.sdk.resources import SERVICE_NAME, Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor
@@ -125,21 +127,40 @@ def record_llm_call(span_name: str, model: str, response) -> None:
     dashboard. response is a langchain_core AIMessage-like object;
     usage_metadata is populated by LangChain's chat model wrappers when the
     underlying provider reports token counts (not all providers always do).
+
+    Also increments the Prometheus counters (app/metrics.py) — same call
+    site for both signals, so the metrics can never drift out of sync with
+    what the traces say happened.
     """
     span = trace.get_current_span()
     span.set_attribute("gen_ai.request.model", model)
+    metrics.LLM_CALLS.labels(model=model).inc()
     usage = getattr(response, "usage_metadata", None)
     if usage:
-        span.set_attribute("gen_ai.usage.input_tokens", usage.get("input_tokens", 0))
-        span.set_attribute("gen_ai.usage.output_tokens", usage.get("output_tokens", 0))
+        input_tokens = usage.get("input_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        span.set_attribute("gen_ai.usage.input_tokens", input_tokens)
+        span.set_attribute("gen_ai.usage.output_tokens", output_tokens)
+        if input_tokens:
+            metrics.LLM_TOKENS.labels(model=model, direction="input").inc(input_tokens)
+        if output_tokens:
+            metrics.LLM_TOKENS.labels(model=model, direction="output").inc(output_tokens)
+        # Imported here, not at module top: token_budget imports app.config,
+        # and keeping observability import-light avoids ordering surprises
+        # for the several modules that import it first thing.
+        from app.agent.token_budget import add_tokens
+
+        add_tokens(input_tokens + output_tokens)
 
 
 def record_tool_call(tool_name: str, ok: bool, domain: str | None = None) -> None:
     """Records a tool-call outcome on the current span — the "tool-call
-    success/failure rate" half of Stage 3.4's observability goal.
+    success/failure rate" half of Stage 3.4's observability goal — and on
+    the mcp_tool_calls_total Prometheus counter.
     """
     span = trace.get_current_span()
     span.set_attribute("mcp.tool.name", tool_name)
     span.set_attribute("mcp.tool.success", ok)
     if domain:
         span.set_attribute("mcp.tool.domain", domain)
+    metrics.MCP_TOOL_CALLS.labels(tool=tool_name, outcome="success" if ok else "failure").inc()

@@ -66,4 +66,7 @@ async def purge_expired(session: AsyncSession) -> int:
     or wire into a future scheduled sweep (see Stage 4.5's SLA sweep)."""
     cutoff = datetime.now(timezone.utc) - TTL
     result = await session.execute(delete(IdempotencyKey).where(IdempotencyKey.created_at < cutoff))
-    return result.rowcount or 0
+    # execute(delete(...)) returns a CursorResult at runtime, but the async
+    # session's type stub only promises Result (no rowcount) — getattr keeps
+    # this honest for both without a cast import.
+    return int(getattr(result, "rowcount", 0) or 0)

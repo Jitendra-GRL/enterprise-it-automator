@@ -1,0 +1,69 @@
+name: Release
+
+# Tag-driven releases: pushing v1.2.3 builds the image from that exact
+# commit, scans it, publishes ghcr.io/<repo>:1.2.3 (+ :latest), and opens a
+# GitHub Release with generated notes. Continuous deployment of :latest on
+# main (deploy.yml) stays as the fast path; tags are the auditable,
+# rollback-able promotion path — `docker run ghcr.io/<repo>:1.2.2` IS the
+# rollback procedure (see docs/RUNBOOKS.md).
+on:
+  push:
+    tags: ["v*.*.*"]
+
+permissions:
+  contents: write
+  packages: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v3
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Compute lowercase image name and version
+        id: meta
+        run: |
+          echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
+          echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
+
+      - name: Build image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ghcr.io/${{ steps.meta.outputs.name }}:scan-candidate
+          cache-from: type=gha
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ steps.meta.outputs.name }}:scan-candidate
+          format: table
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push release image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          push: true
+          tags: |
+            ghcr.io/${{ steps.meta.outputs.name }}:${{ steps.meta.outputs.version }}
+            ghcr.io/${{ steps.meta.outputs.name }}:latest
+          cache-from: type=gha
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          generate_release_notes: true

@@ -21,6 +21,12 @@ ENV PATH="/opt/venv/bin:$PATH"
 
 WORKDIR /app
 COPY app ./app
+# Versioned schema migrations (alembic upgrade head as a release step) and
+# the golden-ticket live eval (python -m evals.run_live) both run in-container
+# against production config — they're deploy/ops surface, not dev clutter.
+COPY alembic.ini ./alembic.ini
+COPY migrations ./migrations
+COPY evals ./evals
 
 # /app/data holds SQLite files when DATABASE_URL/CHECKPOINT_DB_PATH are left
 # at their defaults — irrelevant when compose points them at Postgres (see
@@ -50,9 +56,23 @@ HEALTHCHECK --interval=30s --timeout=5s --start-period=10s --retries=3 \
 # Postgres) rather than CPU-bound, so a single async worker still serves
 # many concurrent in-flight requests — it isn't the same limitation single-
 # threaded CPU-bound work would be.
+# --graceful-timeout 90: on SIGTERM (redeploy, scale-down, node drain)
+# gunicorn stops accepting new connections and gives in-flight requests
+# this long to finish. The default 30s is shorter than a slow agent run
+# (POST /tickets synchronously drives LLM planning + tool execution), which
+# would kill runs mid-flight on every routine redeploy — the LangGraph
+# checkpointer + stuck-ticket sweep recover such orphans, but recovery is
+# for crashes, not for every deploy. 90s covers the p99 run comfortably.
+# --timeout 0: gunicorn's worker liveness timeout is designed for SYNC
+# workers (where a long request means a dead worker); with async uvicorn
+# workers a long-running request is normal and the arbiter heartbeat is
+# what detects real hangs. A nonzero value here would add a second,
+# spurious kill-switch racing --graceful-timeout during drains.
 CMD ["gunicorn", "app.api.main:app", \
      "--workers", "1", \
      "--worker-class", "uvicorn.workers.UvicornWorker", \
      "--bind", "0.0.0.0:8000", \
+     "--graceful-timeout", "90", \
+     "--timeout", "0", \
      "--access-logfile", "-", \
      "--error-logfile", "-"]

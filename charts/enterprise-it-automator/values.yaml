@@ -1,0 +1,80 @@
+# Default values — every value here mirrors a documented env var (see
+# .env.example); the chart is a thin, honest packaging of the same app.
+
+image:
+  repository: ghcr.io/jitendraprabhu-l/enterprise-it-automator
+  # Pin a release tag (release.yml publishes ghcr.io/...:<semver>) — "latest"
+  # is for dev clusters only.
+  tag: latest
+  pullPolicy: IfNotPresent
+
+replicaCount: 1
+# Scaling past 1 replica is SAFE for the SLA sweep (Postgres advisory lock —
+# app/agent/sla_sweep.py) and the checkpointer (Postgres-backed), but the
+# in-memory API rate limiter is per-pod: N replicas multiply the effective
+# rate limit by N until a shared store backs it. Size accordingly.
+
+service:
+  type: ClusterIP
+  port: 8000
+
+ingress:
+  enabled: false
+  className: ""
+  host: it-automator.example.com
+  tls: []
+  annotations: {}
+
+resources:
+  requests:
+    cpu: 250m
+    memory: 512Mi
+  limits:
+    memory: 1Gi
+
+# All secrets come from ONE Kubernetes Secret, never from values (helm
+# release manifests are stored server-side in plaintext-ish secrets and
+# leak via `helm get values`). Create it out-of-band or via ESO/sealed
+# secrets, with keys named exactly like the env vars:
+#
+#   kubectl create secret generic it-automator \
+#     --from-literal=API_KEY=... \
+#     --from-literal=GROQ_API_KEY=... \
+#     --from-literal=MCP_SERVER_TOKEN=... \
+#     --from-literal=DATABASE_URL='postgresql+asyncpg://user:pw@pg:5432/it_automator' \
+#     --from-literal=CHECKPOINT_DB_PATH='postgresql://user:pw@pg:5432/it_automator'
+existingSecret: it-automator
+
+# Non-secret env — anything from .env.example can be set here.
+env:
+  LLM_PROVIDER: groq
+  SENSITIVE_ACTIONS: disable_user,enable_user,revoke_access,create_user,grant_access
+  MAX_TOKENS_PER_TICKET: "0"
+  OIDC_ISSUER: ""
+  OIDC_AUDIENCE: ""
+  OIDC_USERNAME_CLAIM: preferred_username
+
+# The MCP gateway runs as a sidecar in the same pod (stdio's process model
+# doesn't fit separate pods; http transport to localhost keeps the gateway
+# off the network entirely — no NetworkPolicy needed for it).
+mcpSidecar:
+  enabled: true
+  port: 8765
+
+# Run `alembic upgrade head` as a pre-install/pre-upgrade hook Job against
+# DATABASE_URL before new pods roll out. Disable for clusters that manage
+# schema out-of-band.
+migrations:
+  enabled: true
+
+podSecurityContext:
+  runAsNonRoot: true
+  runAsUser: 1000
+  seccompProfile:
+    type: RuntimeDefault
+
+securityContext:
+  allowPrivilegeEscalation: false
+  readOnlyRootFilesystem: false  # /app/data holds runtime scratch on SQLite fallback
+  capabilities:
+    drop: ["ALL"]

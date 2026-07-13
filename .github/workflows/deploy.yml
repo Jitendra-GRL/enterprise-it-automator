@@ -36,7 +36,31 @@ jobs:
         id: image
         run: echo "name=$(echo '${{ github.repository }}' | tr '[:upper:]' '[:lower:]')" >> "$GITHUB_OUTPUT"
 
-      - name: Build and push
+      # Build (without pushing) first so the image can be scanned BEFORE it
+      # is published — a vulnerable image failing the scan never reaches the
+      # registry, instead of being yanked after the fact.
+      - name: Build image for scanning
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          load: true
+          tags: ghcr.io/${{ steps.image.outputs.name }}:scan-candidate
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+      - name: Scan image (Trivy)
+        uses: aquasecurity/trivy-action@0.28.0
+        with:
+          image-ref: ghcr.io/${{ steps.image.outputs.name }}:scan-candidate
+          format: table
+          # Gate on fixable HIGH/CRITICAL OS+library vulns: failing on
+          # unfixable ones would just wedge every deploy until upstream
+          # ships a patch nobody can apply yet.
+          severity: HIGH,CRITICAL
+          ignore-unfixed: true
+          exit-code: "1"
+
+      - name: Push scanned image
         uses: docker/build-push-action@v6
         with:
           context: .

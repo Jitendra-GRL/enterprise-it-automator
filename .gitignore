@@ -15,3 +15,12 @@ venv/
 .idea/
 .vscode/
 /tmp/
+.coverage
+
+# Personal/local files, not part of the project
+JD.docx
+INTERVIEW_PREP.md
+claude.continue.md
+deploy.md
+Untitled document*.pdf
+image/claude.continue/

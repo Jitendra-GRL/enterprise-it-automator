@@ -2,23 +2,27 @@ import asyncio
 import contextlib
 import datetime as dt
 import logging
+import time
 import uuid
+from collections.abc import Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from typing import cast
 
 from ag_ui.encoder import EventEncoder
-from fastapi import Depends, FastAPI, Header, HTTPException, Request
+from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
 from slowapi.util import get_remote_address
 from sqlalchemy import select, text
 
+from app import metrics
 from app.agent.ag_ui_bridge import stream_resume_run, stream_ticket_run
 from app.agent.demo_purge import demo_purge_loop, reset_demo_data_if_due
 from app.agent.runner import resume_ticket_run, start_ticket_run
 from app.agent.sla_sweep import run_sla_sweep, sla_sweep_loop
-from app.api.auth import require_api_client, require_reviewer_token
+from app.api.auth import AuthenticatedReviewer, require_api_client, require_reviewer
 from app.api.idempotency import get_cached_response, store_response
 from app.api.rbac import ApprovalNotAuthorizedError, authorize_reviewer
 from app.api.schemas import (
@@ -179,7 +183,12 @@ app = FastAPI(
     lifespan=lifespan,
 )
 app.state.limiter = limiter
-app.add_exception_handler(RateLimitExceeded, _rate_limit_exceeded_handler)
+# cast: slowapi's handler is typed (Request, RateLimitExceeded) -> Response,
+# narrower than Starlette's (Request, Exception) signature — a known slowapi
+# typing wart; Starlette only ever calls it with RateLimitExceeded here.
+app.add_exception_handler(
+    RateLimitExceeded, cast("Callable[[Request, Exception], Response]", _rate_limit_exceeded_handler)
+)
 
 
 @app.middleware("http")
@@ -189,6 +198,29 @@ async def request_id_middleware(request: Request, call_next):
     response = await call_next(request)
     response.headers["X-Request-ID"] = request_id
     set_request_id(None)
+    return response
+
+
+@app.middleware("http")
+async def http_metrics_middleware(request: Request, call_next):
+    """RED metrics for every request. Labeled by the matched ROUTE TEMPLATE
+    (e.g. /tickets/{ticket_id}), never the raw URL path — raw paths would
+    mint a new Prometheus timeseries per ticket ID (unbounded cardinality,
+    the classic way to melt a Prometheus server). Unmatched paths (404
+    scans, typos) all collapse into one "unmatched" label for the same
+    reason: an attacker probing random URLs must not be able to grow our
+    label space.
+    """
+    start = time.perf_counter()
+    response = await call_next(request)
+    route = request.scope.get("route")
+    path_template = getattr(route, "path", "unmatched")
+    metrics.HTTP_REQUESTS.labels(
+        method=request.method, path=path_template, status=str(response.status_code)
+    ).inc()
+    metrics.HTTP_REQUEST_DURATION.labels(method=request.method, path=path_template).observe(
+        time.perf_counter() - start
+    )
     return response
 
 
@@ -209,6 +241,20 @@ async def health() -> dict:
     from app.mcp_server.circuit_breaker import snapshot_all_breakers
 
     return {"status": "ok", "mcp_domains": snapshot_all_breakers()}
+
+
+@app.get("/metrics")
+async def prometheus_metrics() -> Response:
+    """Prometheus scrape endpoint (see app/metrics.py). Unauthenticated,
+    like /health — Prometheus's scrape loop can't easily attach this app's
+    X-API-Key header, and the payload is operational aggregates (counts,
+    latencies), never ticket/employee/approval row data. Deployments that
+    consider even aggregate rates sensitive should block /metrics at the
+    ingress/proxy layer, where scrapers' network location is enforceable —
+    a stronger control than a shared header secret anyway.
+    """
+    payload, content_type = metrics.render_metrics()
+    return Response(content=payload, media_type=content_type)
 
 
 @app.api_route("/ready", methods=["GET", "HEAD"])
@@ -354,6 +400,7 @@ async def submit_ticket(
         ticket_id = ticket.id
         ticket_text = f"Subject: {payload.subject}\n\n{payload.body}"
 
+    metrics.TICKETS_SUBMITTED.inc()
     result = await start_ticket_run(ticket_id, ticket_text)
 
     if idempotency_key:
@@ -603,13 +650,24 @@ class ApprovalNotFoundError(Exception):
     """Raised by _decide_approval_core when approval_id doesn't exist."""
 
 
-async def _decide_approval_core(approval_id: int, *, approve: bool, reviewer: Reviewer) -> int:
+async def _decide_approval_core(
+    approval_id: int,
+    *,
+    approve: bool,
+    reviewer: Reviewer,
+    auth_method: str = "token",
+    oidc_subject: str | None = None,
+) -> int:
     """Shared core of deciding a pending approval — used by both
     POST /approvals/{id}/decide (dashboard) and the Telegram webhook's
     inline Approve/Reject buttons, so a reviewer deciding via Telegram goes
     through the EXACT same authorization/state-transition logic as the
     dashboard, not a parallel reimplementation that could silently drift or
     weaken. Returns the ticket_id so the caller can resume/report on it.
+
+    auth_method/oidc_subject record HOW the reviewer authenticated
+    ("token", "oidc", "telegram") onto the approval row — see the Approval
+    model's provenance columns.
     """
     async with session_scope() as session:
         approval = await session.get(Approval, approval_id)
@@ -625,6 +683,8 @@ async def _decide_approval_core(approval_id: int, *, approve: bool, reviewer: Re
 
         approval.status = ApprovalStatus.APPROVED if approve else ApprovalStatus.REJECTED
         approval.reviewer = reviewer.username
+        approval.reviewer_auth_method = auth_method
+        approval.reviewer_oidc_subject = oidc_subject
         approval.resolved_at = datetime.now(timezone.utc)
         ticket_id = approval.ticket_id
 
@@ -636,6 +696,7 @@ async def _decide_approval_core(approval_id: int, *, approve: bool, reviewer: Re
                     f"Sensitive action {approval.tool_name} rejected by {reviewer.username}."
                 )
 
+    metrics.APPROVALS_DECIDED.labels(decision="approved" if approve else "rejected").inc()
     return ticket_id
 
 
@@ -649,23 +710,32 @@ async def decide_approval(
     request: Request,
     approval_id: int,
     payload: ApprovalDecision,
-    reviewer: Reviewer = Depends(require_reviewer_token),
+    authed: AuthenticatedReviewer = Depends(require_reviewer),
 ) -> RunResult:
     """Human reviewer approves or rejects a pending sensitive action, then the
     agent graph is resumed from exactly where it paused.
 
-    Authorization (Stage 4.2, scoped down): `reviewer` is resolved from the
-    caller's X-Reviewer-Token (require_reviewer_token), never from a
-    request-body field — that's what actually binds this decision to a
-    specific person rather than a self-asserted name anyone holding the
-    shared API key could type in. From there, an it_admin reviewer may
-    decide any sensitive approval; a manager reviewer may only decide
-    approvals targeting their own direct reports (app/api/rbac.py) — except
-    the seeded public demo reviewer, further confined to demo-owned tickets
-    only (see _authorize_demo_reviewer_scope).
+    Authorization (Stage 4.2, scoped down): `authed.reviewer` is resolved
+    from the caller's X-Reviewer-Token — or, when OIDC is configured, from a
+    verified `Authorization: Bearer <JWT>` (app/api/auth.py's
+    require_reviewer) — never from a request-body field. That's what
+    actually binds this decision to a specific person rather than a
+    self-asserted name anyone holding the shared API key could type in.
+    From there, an it_admin reviewer may decide any sensitive approval; a
+    manager reviewer may only decide approvals targeting their own direct
+    reports (app/api/rbac.py) — except the seeded public demo reviewer,
+    further confined to demo-owned tickets only
+    (see _authorize_demo_reviewer_scope).
     """
+    reviewer = authed.reviewer
     try:
-        ticket_id = await _decide_approval_core(approval_id, approve=payload.approve, reviewer=reviewer)
+        ticket_id = await _decide_approval_core(
+            approval_id,
+            approve=payload.approve,
+            reviewer=reviewer,
+            auth_method=authed.auth_method,
+            oidc_subject=authed.oidc_subject,
+        )
     except ApprovalNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ApprovalAlreadyDecidedError as exc:
@@ -692,13 +762,14 @@ async def decide_approval_stream(
     request: Request,
     approval_id: int,
     payload: ApprovalDecision,
-    reviewer: Reviewer = Depends(require_reviewer_token),
+    authed: AuthenticatedReviewer = Depends(require_reviewer),
 ) -> StreamingResponse:
     """AG-UI-protocol streaming counterpart to POST /approvals/{id}/decide:
     same authorization and decision recording, but a resumed (approved) run
     streams its remaining STEP_*/TOOL_CALL_*/RUN_FINISHED events over SSE
     instead of blocking until the run's next interrupt or completion.
     """
+    reviewer = authed.reviewer
     async with session_scope() as session:
         approval = await session.get(Approval, approval_id)
         if approval is None:
@@ -716,6 +787,8 @@ async def decide_approval_stream(
 
         approval.status = ApprovalStatus.APPROVED if payload.approve else ApprovalStatus.REJECTED
         approval.reviewer = reviewer.username
+        approval.reviewer_auth_method = authed.auth_method
+        approval.reviewer_oidc_subject = authed.oidc_subject
         approval.resolved_at = datetime.now(timezone.utc)
         ticket_id = approval.ticket_id
 
@@ -727,6 +800,7 @@ async def decide_approval_stream(
                     f"Sensitive action {approval.tool_name} rejected by {reviewer.username}."
                 )
 
+    metrics.APPROVALS_DECIDED.labels(decision="approved" if payload.approve else "rejected").inc()
     encoder = EventEncoder()
     run_id = str(uuid.uuid4())
 
@@ -870,7 +944,9 @@ async def _handle_telegram_callback_query(update: dict) -> None:
         return
 
     try:
-        ticket_id = await _decide_approval_core(approval_id, approve=approve, reviewer=reviewer)
+        ticket_id = await _decide_approval_core(
+            approval_id, approve=approve, reviewer=reviewer, auth_method="telegram"
+        )
     except ApprovalNotFoundError:
         await answer_callback_query(callback_query_id, "No such approval.")
         return

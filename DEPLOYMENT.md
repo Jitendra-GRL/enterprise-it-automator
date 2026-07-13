@@ -112,6 +112,12 @@ None of the three signups below can happen on your behalf — each needs your em
 
 1. Sign up at [console.groq.com](https://console.groq.com/keys) (free tier) and create an API key.
 2. That's your `GROQ_API_KEY`. If you already have one from local testing, **generate a new one instead of reusing it** — the original was pasted into a chat session earlier in this project and should be treated as burned.
+3. Model: `render.yaml` pins `GROQ_MODEL=llama-3.3-70b-versatile` — the live
+   golden-ticket eval measured it at 5/6 vs the 8b code-default's 3/6 (see
+   README's "Notes on model choice"). Verify your account has 70b access by
+   running `python -m evals.run_live` once against your key; if it errors on
+   model access, override `GROQ_MODEL=llama-3.1-8b-instant` in the Render
+   dashboard and expect degraded planning quality.
 
 ### Step 3 — Render (compute)
 
@@ -213,6 +219,26 @@ real-reviewers-only: the seeded public demo reviewer token can never be linked, 
 demo traffic never reaches a real person's personal chat. Leave `TELEGRAM_BOT_TOKEN` unset
 to disable this entirely — the dashboard remains the only decision path, as before.
 
+### Step 9 (optional) — Email notifications for pending approvals
+
+A lighter alternative to Step 8: a plain email instead of a Telegram message, with no
+bot/chat linking step. Unlike Telegram, this is notification-only — deciding an approval
+still always requires the dashboard or Telegram, never a reply to the email itself.
+
+1. Set `SMTP_HOST`, `SMTP_PORT`, `SMTP_USERNAME`, `SMTP_PASSWORD` to a real SMTP account.
+   For Gmail: `SMTP_HOST=smtp.gmail.com`, `SMTP_PORT=587`, `SMTP_USERNAME=you@gmail.com`,
+   `SMTP_PASSWORD=<an App Password>` (generate one at
+   [myaccount.google.com/apppasswords](https://myaccount.google.com/apppasswords) — a
+   regular Gmail password won't work here). `SMTP_FROM_ADDRESS` is optional and defaults
+   to `SMTP_USERNAME`.
+2. Set each reviewer's `email` column directly in the `reviewers` table (there's no
+   in-app form for this, the same way `telegram_chat_id` isn't reviewer-editable either).
+
+From then on, every sensitive-action approval a reviewer with an `email` set is entitled
+to decide sends them a plain notification email (same audience rule as Telegram: an
+`it_admin` sees all, a `manager` only their own direct reports). Leave `SMTP_HOST` unset
+to disable this entirely — the dashboard and Telegram remain unaffected either way.
+
 ### Full environment variable list
 
 | Variable | Required | Where it comes from |
@@ -222,10 +248,23 @@ to disable this entirely — the dashboard remains the only decision path, as be
 | `API_KEY` | **required** | pre-generated in `.env.production` |
 | `GROQ_API_KEY` | **required** | console.groq.com — a fresh key, not the one pasted earlier |
 | `LLM_PROVIDER` | defaulted in `render.yaml` | `groq` |
+| `GROQ_MODEL` | defaulted in `render.yaml` | `llama-3.3-70b-versatile` — eval-measured 5/6 vs the 8b code-default's 3/6; see Step 2 |
 | `MCP_SERVER_TOKEN` | not needed by default | only if `MCP_TRANSPORT` is switched to `http`; pre-generated in `.env.production` regardless |
-| `SENSITIVE_ACTIONS` | defaulted in `render.yaml` | `disable_user,revoke_access,create_user,grant_access` |
+| `SENSITIVE_ACTIONS` | defaulted in `render.yaml` | `disable_user,enable_user,revoke_access,create_user,grant_access` — `enable_user` included: re-activating an offboarded account is gated like disabling one (a stale local `.env` missing it is exactly the bug the golden-ticket eval caught) |
 | `DEMO_API_KEY` | optional | a fresh, separate value — see Step 7 above. Leave unset to disable public demo access |
 | `DEMO_DATA_RESET_HOURS` | optional | defaults to `24` — how often the demo client's own tickets/approvals/audit entries are hard-deleted. No effect if `DEMO_API_KEY` is unset |
 | `TELEGRAM_BOT_TOKEN` | optional | from @BotFather — see Step 8 above. Leave unset to disable Telegram approvals entirely |
 | `TELEGRAM_WEBHOOK_SECRET` | optional | a fresh value, same generation method as `API_KEY` — verified against Telegram's own webhook secret-token header |
+| `SMTP_HOST` | optional | see Step 9 above. Leave unset to disable email approval notifications entirely |
+| `SMTP_PORT` | optional | defaults to `587` |
+| `SMTP_USERNAME` | optional | your SMTP account's username |
+| `SMTP_PASSWORD` | optional | your SMTP account's password (an App Password for Gmail) |
+| `SMTP_FROM_ADDRESS` | optional | defaults to `SMTP_USERNAME` if unset |
 | `OTEL_EXPORTER_OTLP_ENDPOINT` | optional | leave blank — tracing stays a no-op |
+| `MAX_TOKENS_PER_TICKET` | optional | per-ticket LLM token hard cap; `0` (default) disables — see `.env.example` and `app/agent/token_budget.py` |
+| `OIDC_ISSUER` / `OIDC_AUDIENCE` | optional | set BOTH to let reviewers authenticate with IdP-issued JWTs on the approval endpoints — see README's "Identity & approval authorization" |
+| `OIDC_JWKS_URL` / `OIDC_USERNAME_CLAIM` | optional | discovery override / claim-to-reviewer mapping (default `preferred_username`) |
+
+Prometheus can scrape `https://<your-app>/metrics` (unauthenticated by
+design, aggregates only — see the endpoint's docstring); Grafana Cloud's
+free tier or the repo's compose observability overlay both work against it.

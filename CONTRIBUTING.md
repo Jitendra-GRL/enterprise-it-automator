@@ -7,7 +7,7 @@ git clone https://github.com/JitendraPrabhu-l/enterprise-it-automator.git
 cd enterprise-it-automator
 python -m venv .venv && source .venv/bin/activate   # .venv\Scripts\activate on Windows
 pip install -r requirements.txt
-pip install ruff pytest pytest-asyncio               # or: pip install -e ".[dev]"
+pip install ruff mypy pytest pytest-asyncio pytest-cov   # or: pip install -e ".[dev]"
 
 cp .env.example .env
 # set at least GROQ_API_KEY (free: https://console.groq.com/keys)
@@ -16,22 +16,38 @@ cp .env.example .env
 ## Before opening a PR
 
 ```bash
-ruff check app/ tests/
-pytest -v
+ruff check app/ tests/ evals/
+mypy                      # app/ must stay clean (config in pyproject.toml)
+pytest -q --cov           # coverage floor enforced (pyproject [tool.coverage.report])
 ```
 
-Both run in CI (`.github/workflows/ci.yml`) on every push/PR to `main` — a PR won't
-merge cleanly if either fails locally.
+All three run in CI (`.github/workflows/ci.yml`) on every push/PR to `main` —
+plus a strict `pip-audit` of the locked dependencies — so a PR won't merge
+cleanly if any fails locally.
+
+Two changes carry extra steps:
+
+- **Schema (app/db/models.py)**: cut a migration with
+  `alembic revision --autogenerate -m "<what changed>"` and commit it —
+  `tests/test_migrations.py` fails any model change without one.
+- **Prompts / planner / LLM provider**: run the live eval,
+  `python -m evals.run_live` — CI replays recorded model outputs and cannot
+  see model-behavior drift; this can. If the contract deliberately moved,
+  re-record the affected golden ticket in `evals/golden.py`.
 
 ## Project layout
 
 ```
 app/
   agent/        LangGraph graph, LLM adapter, prompts, AG-UI streaming bridge
-  api/           FastAPI routes, auth, RBAC, request/response schemas
+  api/           FastAPI routes, auth (API-key/reviewer-token/OIDC), RBAC, schemas
   db/            SQLAlchemy models, session/engine setup, seed script
   mcp_server/    MCP tool server (identity/access/ticketing domains + gateway)
   static/        Vanilla HTML/CSS/JS dashboard (no build step)
+charts/          Helm chart (probes, migration hook, MCP sidecar)
+evals/           Golden-ticket eval set + runner (CI replay & live mode)
+migrations/      Alembic migration chain (see "Schema" above)
+observability/   Prometheus/Alertmanager/Grafana configs for the compose overlay
 tests/           One test file per module under test, mirroring app/'s layout
 ```
 

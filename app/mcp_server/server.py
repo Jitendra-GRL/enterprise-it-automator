@@ -34,6 +34,7 @@ import functools
 import hmac
 import inspect
 import logging
+from typing import Literal
 
 from mcp.server.fastmcp import FastMCP
 from mcp.server.transport_security import TransportSecuritySettings
@@ -46,7 +47,9 @@ from app.config import get_settings
 from app.db.session import init_db
 from app.mcp_server.access_server import access_mcp
 from app.mcp_server.identity_server import identity_mcp
+from app.mcp_server.prompts import register_prompts
 from app.mcp_server.rate_limit import check_rate_limit
+from app.mcp_server.resources import register_resources
 from app.mcp_server.tools import is_sensitive
 from app.mcp_server.ticketing_server import ticketing_mcp
 
@@ -71,11 +74,78 @@ mcp = FastMCP(
     port=_settings.mcp_server_port,
 )
 
+# Resources (read-only, app-controlled data — audit trail, employee
+# directory) and prompts (reusable ticket-drafting templates) registered
+# at import time, same as the domain servers' @domain_mcp.tool()
+# decorators — unlike tools, these aren't composed from separate domain
+# FastMCP instances (see resources.py/prompts.py docstrings for why).
+register_resources(mcp)
+register_prompts(mcp)
+
 _DOMAIN_SERVERS = {
     "identity": identity_mcp,
     "access": access_mcp,
     "ticketing": ticketing_mcp,
 }
+
+
+def _logged(tool_name: str, fn):
+    """Wraps a tool function so its start/success/error are sent to the
+    client as MCP logging notifications (notifications/message —
+    MCP spec's Utilities: Logging), not just written to this process's own
+    stderr/stdout.
+
+    Server-side stderr logging (Python's `logging` module, unconfigured here
+    — see logging_config.py's docstring for why configure_logging() is only
+    ever called from app/api/main.py, not this module) only reaches a stdio
+    client, since stdio is the one transport where the host captures the
+    child process's stderr automatically (per /docs/tools/debugging: "all
+    messages logged to stderr will be captured by the host application").
+    Over streamable-HTTP, stderr goes nowhere a remote client can see —
+    log message notifications are the transport-agnostic mechanism the spec
+    actually defines for "tell the client what's happening," so this is the
+    only way an HTTP-connected client (e.g. MCP Inspector, or a future
+    non-stdio orchestrator) gets any visibility into tool execution at all.
+
+    Wrapped at gateway-composition time alongside _rate_limited, for the
+    same reason given there: keeps this cross-cutting concern out of every
+    individual @domain_mcp.tool() function.
+    """
+    async def _emit(level: Literal["debug", "info", "warning", "error"], message: str) -> None:
+        try:
+            ctx = mcp.get_context()
+            await ctx.log(level, message, logger_name=tool_name)
+        except (LookupError, ValueError):
+            # get_context() falls back to request_context=None (catching its
+            # own internal LookupError) when called outside an active MCP
+            # request — e.g. tests exercising domain-server tool functions
+            # directly, without going through a real MCP session — and
+            # ctx.log() then raises ValueError reading that None context.
+            # Falling back to a no-op here, rather than letting either
+            # propagate, keeps logging purely best-effort: it must never be
+            # the reason a tool call fails.
+            pass
+
+    if inspect.iscoroutinefunction(fn):
+
+        @functools.wraps(fn)
+        async def async_wrapper(*args, **kwargs):
+            await _emit("debug", f"{tool_name} invoked")
+            try:
+                result = await fn(*args, **kwargs)
+            except Exception as exc:
+                await _emit("error", f"{tool_name} failed: {exc}")
+                raise
+            await _emit("debug", f"{tool_name} completed")
+            return result
+
+        return async_wrapper
+
+    @functools.wraps(fn)
+    def sync_wrapper(*args, **kwargs):
+        return fn(*args, **kwargs)
+
+    return sync_wrapper
 
 
 def _rate_limited(tool_name: str, fn):
@@ -125,9 +195,11 @@ async def _compose_gateway() -> None:
         domain_tools = await domain_server.list_tools()
         for tool in domain_tools:
             registered = domain_server._tool_manager.get_tool(tool.name)
+            if registered is None:  # list_tools() just returned it — can't happen
+                raise RuntimeError(f"Domain server {prefix!r} lists {tool.name!r} but can't resolve it")
             namespaced_name = f"{prefix}_{tool.name}"
             mcp.add_tool(
-                _rate_limited(namespaced_name, registered.fn),
+                _rate_limited(namespaced_name, _logged(namespaced_name, registered.fn)),
                 name=namespaced_name,
                 description=tool.description,
                 annotations=tool.annotations,

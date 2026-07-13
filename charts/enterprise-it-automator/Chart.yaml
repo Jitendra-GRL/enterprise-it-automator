@@ -1,0 +1,9 @@
+apiVersion: v2
+name: enterprise-it-automator
+description: >-
+  MCP-enabled IT automation agent (FastAPI + LangGraph + custom MCP server)
+  with server-enforced human-in-the-loop approvals. Expects an external
+  Postgres (app DB + LangGraph checkpointer) — see values.yaml.
+type: application
+version: 0.1.0
+appVersion: "0.1.0"

@@ -6,6 +6,8 @@ aiosqlite==0.22.1
     # via
     #   -r requirements.txt
     #   langgraph-checkpoint-sqlite
+alembic==1.18.5
+    # via -r requirements.txt
 annotated-doc==0.0.4
     # via fastapi
 annotated-types==0.7.0
@@ -43,6 +45,8 @@ charset-normalizer==3.4.7
     # via requests
 click==8.4.2
     # via uvicorn
+coverage==7.15.1
+    # via pytest-cov
 cryptography==49.0.0
     # via pyjwt
 deprecated==1.3.1
@@ -165,6 +169,10 @@ limits==5.8.0
     # via slowapi
 lomond==0.3.3
     # via ibm-watsonx-ai
+mako==1.3.12
+    # via alembic
+markupsafe==3.0.3
+    # via mako
 mcp==1.28.1
     # via -r requirements.txt
 numpy==2.5.1
@@ -209,7 +217,11 @@ packaging==26.2
 pandas==2.3.3
     # via ibm-watsonx-ai
 pluggy==1.6.0
-    # via pytest
+    # via
+    #   pytest
+    #   pytest-cov
+prometheus-client==0.25.0
+    # via -r requirements.txt
 protobuf==7.35.1
     # via
     #   googleapis-common-protos
@@ -247,12 +259,17 @@ pydantic-settings==2.14.2
 pygments==2.20.0
     # via pytest
 pyjwt==2.13.0
-    # via mcp
+    # via
+    #   -r requirements.txt
+    #   mcp
 pytest==9.1.1
     # via
     #   -r requirements.txt
     #   pytest-asyncio
+    #   pytest-cov
 pytest-asyncio==1.4.0
+    # via -r requirements.txt
+pytest-cov==7.1.0
     # via -r requirements.txt
 python-dateutil==2.9.0.post0
     # via
@@ -304,7 +321,9 @@ sniffio==1.3.1
     #   langsmith
     #   openai
 sqlalchemy==2.0.51
-    # via -r requirements.txt
+    # via
+    #   -r requirements.txt
+    #   alembic
 sqlite-vec==0.1.9
     # via langgraph-checkpoint-sqlite
 sse-starlette==3.4.5
@@ -324,6 +343,7 @@ tqdm==4.68.3
     # via openai
 typing-extensions==4.16.0
     # via
+    #   alembic
     #   anthropic
     #   fastapi
     #   groq

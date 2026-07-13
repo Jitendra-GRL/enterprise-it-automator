@@ -1,0 +1,18 @@
+{{ include "eit.fullname" . }} deployed.
+
+1. Port-forward to try it:
+     kubectl port-forward svc/{{ include "eit.fullname" . }} 8000:{{ .Values.service.port }}
+   Dashboard: http://127.0.0.1:8000/   API docs: /docs   Metrics: /metrics
+
+2. Secrets come from the '{{ .Values.existingSecret }}' Secret (API_KEY,
+   GROQ_API_KEY, MCP_SERVER_TOKEN, DATABASE_URL, CHECKPOINT_DB_PATH).
+   If pods CrashLoop on startup, check it exists and has every key:
+     kubectl describe secret {{ .Values.existingSecret }}
+
+3. Schema: {{ if .Values.migrations.enabled }}applied by the pre-upgrade Job
+   ({{ include "eit.fullname" . }}-migrate) via `alembic upgrade head`.{{ else }}
+   migrations are DISABLED — apply `alembic upgrade head` out-of-band.{{ end }}
+
+4. Scaling: replicas > 1 is safe for the SLA sweep (Postgres advisory lock)
+   and HITL resume (Postgres checkpointer), but the per-pod in-memory rate
+   limiter multiplies the effective request limit by the replica count.

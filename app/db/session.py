@@ -87,6 +87,9 @@ async def init_db() -> None:
     await _ensure_column(engine, table="api_clients", column="data_last_purged_at", ddl_type="TIMESTAMP")
     await _ensure_column(engine, table="employee_users", column="owned_by_client_id", ddl_type="INTEGER")
     await _ensure_column(engine, table="reviewers", column="telegram_chat_id", ddl_type="VARCHAR(64)")
+    await _ensure_column(engine, table="reviewers", column="email", ddl_type="VARCHAR(128)")
+    await _ensure_column(engine, table="approvals", column="reviewer_auth_method", ddl_type="VARCHAR(16)")
+    await _ensure_column(engine, table="approvals", column="reviewer_oidc_subject", ddl_type="VARCHAR(128)")
 
 
 async def _ensure_column(engine, *, table: str, column: str, ddl_type: str) -> None:
@@ -133,3 +136,42 @@ async def session_scope() -> AsyncIterator[AsyncSession]:
         except Exception:
             await session.rollback()
             raise
+
+
+@asynccontextmanager
+async def try_advisory_lock(lock_id: int) -> AsyncIterator[bool]:
+    """Best-effort cross-replica mutual exclusion via Postgres session-level
+    advisory locks: yields True if this process holds lock_id for the
+    duration of the block, False if another replica already does (caller
+    should skip its pass, not wait — these guard periodic background jobs
+    where "someone is doing it" is all that matters).
+
+    On non-Postgres engines yields True unconditionally: SQLite here means
+    a single-process deployment (a shared SQLite file across replicas is
+    not a supported topology anywhere in this app), so there's nobody to
+    exclude and the sweep behaves exactly as it did before this existed.
+
+    Correctness notes, learned from the advisory-lock footgun list:
+    - pg_try_advisory_lock is SESSION-scoped, so the lock lives exactly as
+      long as this connection — the `async with engine.connect()` block —
+      and the explicit finally-unlock matters because pooled connections
+      are REUSED, not closed, on release; without it the lock would leak
+      into the pool and never be released until pool recycle.
+    - If the process dies mid-pass, Postgres releases the session's locks
+      when the connection drops — no stale-lock janitor needed.
+    - The lock connection is deliberately separate from the sweep's own
+      session_scope() sessions; holding it open serializes nothing else.
+    """
+    engine = get_engine()
+    if engine.dialect.name != "postgresql":
+        yield True
+        return
+    async with engine.connect() as conn:
+        acquired = (
+            await conn.execute(text("SELECT pg_try_advisory_lock(:id)"), {"id": lock_id})
+        ).scalar()
+        try:
+            yield bool(acquired)
+        finally:
+            if acquired:
+                await conn.execute(text("SELECT pg_advisory_unlock(:id)"), {"id": lock_id})

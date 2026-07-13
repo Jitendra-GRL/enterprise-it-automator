@@ -36,3 +36,9 @@ class AgentState(TypedDict):
     done: bool
     error: str | None
     replan_count: int
+    # Cumulative LLM tokens (input+output) this ticket has spent, persisted
+    # by plan/replan so it survives checkpointing across HITL interrupts —
+    # what makes MAX_TOKENS_PER_TICKET a per-TICKET budget rather than
+    # per-request (see app/agent/token_budget.py). Checkpoints written
+    # before this key existed load fine: readers use state.get(..., 0).
+    tokens_used: int

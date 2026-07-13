@@ -112,6 +112,15 @@ services:
       # GET /demo-key for public demo/portfolio deployments; see
       # .env.example's DEMO_API_KEY comment. Leave unset to disable.
       DEMO_API_KEY: ${DEMO_API_KEY:-}
+      # Optional hard cap on LLM tokens per ticket (0 = disabled) — see
+      # app/agent/token_budget.py.
+      MAX_TOKENS_PER_TICKET: ${MAX_TOKENS_PER_TICKET:-0}
+      # Optional OIDC reviewer identity (Stage 4.1, right-sized): set BOTH
+      # to enable IdP-verified Authorization: Bearer JWTs on the approval
+      # endpoints alongside X-Reviewer-Token — see app/api/oidc.py.
+      OIDC_ISSUER: ${OIDC_ISSUER:-}
+      OIDC_AUDIENCE: ${OIDC_AUDIENCE:-}
+      OIDC_USERNAME_CLAIM: ${OIDC_USERNAME_CLAIM:-preferred_username}
     ports:
       - "8000:8000"
     volumes:

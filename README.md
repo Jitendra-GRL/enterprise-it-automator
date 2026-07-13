@@ -53,6 +53,8 @@ Prefer containers? `docker compose up --build` — see **[Running with Docker](#
 - [Notes on model choice](#notes-on-model-choice)
 - [Contributing](CONTRIBUTING.md)
 - [Deployment guide](DEPLOYMENT.md)
+- [Security policy](SECURITY.md) · [Threat model](docs/THREAT-MODEL.md) · [Runbooks](docs/RUNBOOKS.md)
+- [Helm chart](charts/enterprise-it-automator/)
 
 ## Architecture
 
@@ -223,7 +225,8 @@ python -m app.mcp_server.server
 ```
 
 Speaks MCP JSON-RPC over stdio — connect with any MCP-compatible client or
-the [MCP Inspector](https://github.com/modelcontextprotocol/inspector).
+the [MCP Inspector](https://github.com/modelcontextprotocol/inspector) (see
+**Debugging with MCP Inspector** below).
 
 Run it as a standalone remote server over HTTP instead:
 
@@ -280,6 +283,48 @@ the agent side to point at the `https://` front door. This project doesn't
 ship that proxy config (no code change required in `app/` either way —
 it's purely how the process is fronted), the same "runtime concern, not
 an app concern" pattern as **Secrets management** above.
+
+#### Debugging with MCP Inspector
+
+The [MCP Inspector](https://github.com/modelcontextprotocol/inspector) is an
+interactive UI for browsing this gateway's tools, resources, and prompts,
+calling them by hand, and watching the raw JSON-RPC exchange and logging
+notifications — the fastest way to check a change without going through the
+LangGraph agent at all. Requires Node.js (`npx` ships with it); no install
+step, no changes to this repo.
+
+**Against the local stdio server** (zero extra config):
+
+```bash
+npx @modelcontextprotocol/inspector python -m app.mcp_server.server
+```
+
+**Against a standalone HTTP server** — start the gateway first:
+
+```bash
+MCP_TRANSPORT=http MCP_SERVER_TOKEN=some-secret python -m app.mcp_server.server --transport http
+```
+
+then, in another terminal, launch Inspector with no launch command (connect
+to an already-running server instead):
+
+```bash
+npx @modelcontextprotocol/inspector
+```
+
+In the Inspector UI, set **Transport Type** to `Streamable HTTP`, **URL** to
+`http://127.0.0.1:8765/mcp`, and add an **Authorization** header of
+`Bearer some-secret` (see **Securing the HTTP transport for real
+deployment** above — the gateway refuses unauthenticated HTTP connections by
+design) under **Configuration → Request Headers** before connecting.
+
+Once connected, the **Resources** tab lists `directory://employees`,
+`audit://log/recent`, and the `audit://ticket/{ticket_id}` template; the
+**Prompts** tab lists the three `draft_*_ticket` templates; the **Tools**
+tab lists all 9 namespaced gateway tools plus `is_sensitive_action`; and the
+**Notifications** pane surfaces every `_logged`-wrapped tool call's
+invoked/completed/failed log message in real time as you call tools by
+hand.
 
 ## Example flow
 
@@ -456,6 +501,35 @@ No vendor SDK is imported directly — instrumentation always goes through
 OTel's generic API, so swapping the exporter target is a config change, not
 a call-site rewrite.
 
+### Metrics, dashboards & alerts
+
+Tracing answers "what happened inside this run"; **`GET /metrics`**
+(`app/metrics.py`, Prometheus exposition) answers "what are the rates,
+latencies, and error budgets over all runs" — the signal dashboards and
+alert rules consume. Beyond RED metrics per route (template-labeled, so
+unmatched-path probing can't mint unbounded timeseries), the domain series
+are the interesting ones: `tickets_finalized_total{status}`,
+`approvals_pending` / `approvals_decided_total` / `approvals_escalated_total`,
+`mcp_tool_calls_total{tool,outcome}`, `mcp_circuit_breaker_open{domain}`,
+`llm_tokens_total{model,direction}`, and
+`ticket_token_budget_exceeded_total`. The metric increments live at the
+same call sites as the tracing spans, so the two signals can't drift.
+
+A ready-made stack ships as a compose overlay — Prometheus with seven alert
+rules (each annotated with its [runbook entry](docs/RUNBOOKS.md#alerts)),
+Alertmanager, and Grafana with a provisioned overview dashboard:
+
+```bash
+GRAFANA_ADMIN_PASSWORD=... docker compose -f docker-compose.yml -f docker-compose.observability.yml up -d
+# Grafana :3000 · Prometheus :9090 · Alertmanager :9093
+```
+
+Cost note: `MAX_TOKENS_PER_TICKET` (default 0 = off) hard-caps LLM spend
+per ticket across HITL resumes — the budget is checkpointed with the run,
+so an approval-resume never grants a fresh allowance. Exceeding it fails
+the ticket explicitly and increments the corresponding alert-backed counter
+(see `app/agent/token_budget.py`).
+
 ## Secrets management
 
 `app/config.py`'s `Settings` (pydantic-settings) reads every credential from
@@ -481,14 +555,13 @@ the Docker image (`.dockerignore` already excludes `.env`) or commit them to
 
 ## Identity & approval authorization (scoped-down Stage 4)
 
-Two pieces of "real identity & enterprise integration" are implemented in a
-right-sized form rather than the full versions described in `ROADMAP.md`'s
-Stage 4 — a real Keycloak/OIDC deployment, MCP OAuth 2.1, and a
-SCIM/OpenLDAP-backed identity sync were all judged out of scope for a solo
-project per the roadmap's own trap notes, and are documented as
+Three pieces of "real identity & enterprise integration" are implemented in
+a right-sized form rather than the full versions described in `ROADMAP.md`'s
+Stage 4 — MCP OAuth 2.1 and a SCIM/OpenLDAP-backed identity sync remain out
+of scope per the roadmap's own trap notes, and are documented as
 deliberately skipped rather than silently missing:
 
-- **Reviewer authentication** (`app/api/auth.py`'s `require_reviewer_token`)
+- **Reviewer authentication** (`app/api/auth.py`'s `require_reviewer`)
   — each `Reviewer` row has its own per-reviewer secret `token`, generated
   by `python -m app.db.seed` and required via the `X-Reviewer-Token` header
   on `POST /approvals/{id}/decide`. This is what actually binds a decision
@@ -497,6 +570,22 @@ deliberately skipped rather than silently missing:
   holding the one shared `API_KEY` could set to any registered reviewer's
   name (including `admin`) — a real impersonation gap, since fixed. The
   request body no longer has a `reviewer` field at all.
+- **OIDC-verified reviewer identity** (`app/api/oidc.py` — Stage 4.1,
+  right-sized): set `OIDC_ISSUER` + `OIDC_AUDIENCE` and reviewers may
+  instead present `Authorization: Bearer <JWT>` from any spec-compliant IdP
+  (Keycloak, Auth0, Entra ID, Okta). The token is verified end-to-end —
+  signature against the IdP's published JWKS (fetched via OIDC discovery,
+  cached, refetch-throttled on rotation), issuer, audience, expiry, RS256
+  pinned (never trusting the token's own `alg`) — then its
+  `preferred_username` claim must match a registered `Reviewer`. This app
+  is the resource-server half only: no login flows, no sessions, no token
+  issuance. Every decided approval records its provenance
+  (`reviewer_auth_method`: `token` / `oidc` / `telegram`, plus the IdP's
+  immutable `sub` for OIDC) — an auditor can distinguish "the IdP vouched
+  this was mchen" from "someone presented mchen's shared secret." A
+  presented-but-invalid JWT is rejected outright, never silently
+  downgraded to the token path; with OIDC unconfigured (default), behavior
+  is byte-for-byte pre-OIDC.
 - **Lightweight RBAC** (`app/api/rbac.py`) — layers an authorization check
   on top of the now-authenticated reviewer identity. A `reviewers` table
   assigns each reviewer a role (`it_admin` or `manager`);
@@ -521,6 +610,14 @@ deliberately skipped rather than silently missing:
   one. Deliberately real-reviewers-only: the seeded public demo reviewer
   can never be linked, so public demo traffic can't reach a real person's
   chat.
+- **Email approval notifications** (`app/notifications/email.py`, opt-in via
+  `SMTP_HOST` — see `DEPLOYMENT.md`'s Step 9) — a lighter alternative to
+  Telegram: a reviewer with an `email` set on their `Reviewer` row gets a
+  plain notification email for every sensitive-action approval they're
+  entitled to decide. Notification-only, deliberately — there's no
+  reply-to-decide mechanism, since replying to an email isn't a safe way to
+  authenticate a decision; the dashboard and Telegram remain the only ways
+  to actually approve/reject.
 - **Approval replay prevention** (`app/mcp_server/approval_gate.py`) — an
   `Approval`'s `executed_at` is set the first time it authorizes a
   sensitive tool call; a second attempt to use the same `approval_id` is
@@ -632,15 +729,36 @@ discovery means for this project rather than just hardening an edge case:
   to the host — only the `app` service needs to reach it, over Docker's
   internal network, and the bearer token doesn't need a second, needless
   network exposure to defend.
+- **Resources, prompts, and logging notifications** — a pass against the
+  [Getting Started](https://modelcontextprotocol.io/docs/getting-started/intro)
+  docs found the gateway only ever implemented the *tools* half of the MCP
+  primitive surface. Now closed: (1) **resources**
+  (`app/mcp_server/resources.py`) expose read-only, app-controlled data —
+  `directory://employees`, `audit://log/recent`, and the
+  `audit://ticket/{ticket_id}` template — for a client to browse directly,
+  distinct from a *tool* the model decides to invoke; (2) **prompts**
+  (`app/mcp_server/prompts.py`) expose `draft_onboarding_ticket`/
+  `draft_offboarding_ticket`/`draft_access_change_ticket` templates any MCP
+  client can surface for a human to fill in and submit — deliberately
+  *not* the same templates as `app/agent/prompts/*.py`, which are internal,
+  server-rendered planner prompts with a live `{tool_reference}`
+  substitution that would be meaningless handed to an arbitrary client; (3)
+  every tool call now emits **MCP logging notifications**
+  (`notifications/message`, via `server.py`'s `_logged` wrapper) at
+  invocation/success/error — the only transport-agnostic way a caller gets
+  visibility into tool execution, since stderr logging (the other
+  documented option) only reaches a *stdio* client automatically, never an
+  HTTP one.
 
 ## Tests
 
 ```bash
-pytest -v          # full suite
-ruff check app/ tests/    # lint
+pytest -q --cov    # full suite with the coverage gate (floor: 80%, currently ~85%)
+ruff check app/ tests/ evals/   # lint
+mypy               # typecheck (app/ is fully clean under the config in pyproject.toml)
 ```
 
-264 tests (`tests/`, one file per module under test) covering, at a high level:
+417 tests (`tests/`, one file per module under test) covering, at a high level:
 
 - **Tool layer** — CRUD + audit logging, idempotency rejection (disabling an
   already-disabled user, revoking an ungranted resource), department-based
@@ -666,15 +784,55 @@ ruff check app/ tests/    # lint
   the AG-UI streaming bridge end-to-end (a full run against a real compiled
   graph through completion/interrupt/error paths, plus the two streaming
   FastAPI endpoints' auth/DB wiring — see **Live streaming via AG-UI** above).
+- **Enterprise hardening** — Prometheus metrics wiring, OIDC token
+  verification (real RSA keys, faked JWKS boundary only), cross-replica
+  advisory-lock protocol, per-ticket token budgets against a real compiled
+  graph, Alembic migration-chain integrity (upgrade-head parity with the
+  models AND with init_db()'s self-healing path — editing a model without
+  cutting a migration fails CI), and the golden-ticket eval replay below.
 
-CI (`.github/workflows/ci.yml`) runs the full suite plus `ruff` on every push/PR
-to `main`; `deploy.yml` builds and publishes the Docker image to GHCR once CI passes.
+**Golden-ticket evals** (`evals/`): six realistic tickets — one per
+category plus re-onboarding, a no-action inquiry, and a prompt-injection
+attempt — with pinned expectations (category, exact plan tools + args,
+HITL gating, forbidden tools). CI replays recorded model outputs through
+the real graph (`tests/test_golden_tickets.py`, must be 6/6); `python -m
+evals.run_live` runs the same contract against the real configured LLM to
+catch model/prompt drift before it ships — run it before changing
+`LLM_PROVIDER`, model pins, or anything in `app/agent/prompts/`. It has
+already earned its keep twice: authoring it exposed a stale local
+`SENSITIVE_ACTIONS` that silently exempted `enable_user` from approval, and
+its first live run measured the original 8b default at 3/6 vs 5/6 for the
+70b model this repo now pins (see **Notes on model choice**).
+
+CI (`.github/workflows/ci.yml`) gates every push/PR to `main` on `ruff`,
+`mypy`, the full suite with a coverage floor, and a strict `pip-audit` of
+the locked dependency resolution; `deploy.yml` then builds the image, scans
+it with Trivy (failing on fixable HIGH/CRITICAL before anything is pushed),
+and publishes to GHCR. Tagging `v*.*.*` cuts a versioned, scanned release
+image + GitHub Release (`release.yml`); Dependabot files weekly grouped
+update PRs through the same gate. Schema changes ship as reviewed Alembic
+migrations (`alembic upgrade head`; on Kubernetes, a pre-upgrade Job — see
+`charts/enterprise-it-automator/`, `helm lint`-clean with liveness/readiness
+probes, non-root security contexts, and a localhost-only MCP sidecar).
+Operational docs: [SECURITY.md](SECURITY.md),
+[docs/THREAT-MODEL.md](docs/THREAT-MODEL.md),
+[docs/RUNBOOKS.md](docs/RUNBOOKS.md).
 
 ## Notes on model choice
 
-Default is Groq's `llama-3.1-8b-instant` (free tier, fast, broadly available).
-`llama-3.3-70b-versatile` is often blocked at the org level on free Groq
-accounts — swap `GROQ_MODEL` in `.env` if you have access to a larger model.
+The code default is Groq's `llama-3.1-8b-instant` (free tier, fast, broadly
+available) — but **measure before trusting it**: the live golden-ticket eval
+(`python -m evals.run_live`, 2026-07-13) scored the 8b model **3/6** — it
+hallucinated a cross-domain tool name (`access_get_user`), misclassified a
+status inquiry as ONBOARDING, and padded plans with unrequested grant steps
+(the HITL gate and injection-refusal still held — the failures were plan
+quality, not safety). `llama-3.3-70b-versatile` on the same free key scored
+**5/6** (its one miss: echoing the ticket's `"VPN"` capitalization as a
+resource name), so `.env`/`render.yaml` in this repo pin
+`GROQ_MODEL=llama-3.3-70b-versatile`. Trade-offs: 70b has tighter free-tier
+rate/daily-token limits than 8b, and some free Groq orgs lack 70b access
+entirely — `run_live` fails fast with the provider's error if yours does,
+which is also your one-command way to score any other candidate model.
 To point at Anthropic, watsonx, or OpenRouter instead, set `LLM_PROVIDER`
 accordingly and fill in the matching credentials in `.env` — no code changes
 required.

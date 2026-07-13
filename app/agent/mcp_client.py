@@ -20,10 +20,24 @@ from mcp import ClientSession, StdioServerParameters
 from mcp.client.stdio import stdio_client
 from mcp.client.streamable_http import streamable_http_client
 
+from app import metrics
 from app.config import get_settings
-from app.mcp_server.circuit_breaker import CircuitOpenError, get_breaker
+from app.mcp_server.circuit_breaker import CircuitBreaker, CircuitOpenError, CircuitState, get_breaker
 from app.mcp_server.registry import ServerLocation, resolve_domain_for_tool, resolve_server_for_tool
 from app.observability import record_tool_call
+
+
+def _sync_breaker_gauge(domain: str, breaker: CircuitBreaker) -> None:
+    """Mirrors the domain's breaker state onto the mcp_circuit_breaker_open
+    gauge (1 = open or half-open, 0 = closed) so an alert rule can fire on
+    "a backend domain has been tripped for N minutes" without log-scraping.
+    Called after every state-changing breaker interaction rather than on a
+    timer — the gauge is only ever as stale as the last call attempt, and a
+    domain with no traffic has no failures to alert on anyway.
+    """
+    metrics.CIRCUIT_BREAKER_OPEN.labels(domain=domain).set(
+        0 if breaker.state == CircuitState.CLOSED else 1
+    )
 
 
 @asynccontextmanager
@@ -34,6 +48,11 @@ async def _session_at(location: ServerLocation):
         # FastMCP applies no auth of its own, so without this any network
         # client that can reach the server could call sensitive tools
         # directly, bypassing the FastAPI layer's auth entirely.
+        if location.url is None:
+            raise RuntimeError(
+                "Server registry maps a domain to transport 'http' with no url — "
+                "check MCP_SERVER_URL / app.mcp_server.registry."
+            )
         token = get_settings().mcp_server_token
         headers = {"Authorization": f"Bearer {token}"} if token else {}
         async with httpx.AsyncClient(headers=headers) as http_client:
@@ -94,6 +113,7 @@ async def call_tool(session: ClientSession, name: str, arguments: dict[str, Any]
     domain = resolve_domain_for_tool(name)
     breaker = get_breaker(domain)
     if not breaker.allow_request():
+        _sync_breaker_gauge(domain, breaker)
         raise CircuitOpenError(
             f"Circuit breaker open for domain {domain!r} — too many recent "
             f"failures, refusing to call {name!r} until the recovery timeout elapses."
@@ -103,6 +123,7 @@ async def call_tool(session: ClientSession, name: str, arguments: dict[str, Any]
         result = await session.call_tool(name, arguments)
     except Exception:
         breaker.record_failure()
+        _sync_breaker_gauge(domain, breaker)
         record_tool_call(name, ok=False, domain=domain)
         raise
 
@@ -115,10 +136,12 @@ async def call_tool(session: ClientSession, name: str, arguments: dict[str, Any]
             breaker.record_failure()
         else:
             breaker.record_success()
+        _sync_breaker_gauge(domain, breaker)
         record_tool_call(name, ok=False, domain=domain)
         raise exc
 
     breaker.record_success()
+    _sync_breaker_gauge(domain, breaker)
     record_tool_call(name, ok=True, domain=domain)
     for block in result.content:
         if hasattr(block, "text"):
@@ -126,7 +149,7 @@ async def call_tool(session: ClientSession, name: str, arguments: dict[str, Any]
     return None
 
 
-def is_transient_error(exc: Exception) -> bool:
+def is_transient_error(exc: BaseException) -> bool:
     """Distinguishes retryable/transport failures from permanent
     application-logic ones. Shared by the agent's node-level RetryPolicy
     (app/agent/graph.py) and the per-domain circuit breaker

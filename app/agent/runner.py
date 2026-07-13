@@ -10,6 +10,7 @@ from pathlib import Path
 from langgraph.checkpoint.sqlite.aio import AsyncSqliteSaver
 from langgraph.types import Command
 
+from app.agent import token_budget
 from app.agent.graph import compile_graph
 from app.agent.mcp_session_cache import ticket_run_session
 from app.config import get_settings
@@ -67,8 +68,10 @@ async def start_ticket_run(ticket_id: int, ticket_text: str) -> dict:
         "done": False,
         "error": None,
         "replan_count": 0,
+        "tokens_used": 0,
     }
     config = _thread_config(ticket_id)
+    token_budget.start_accounting(0)
     async with ticket_run_session(ticket_id):
         result = await graph.ainvoke(initial_state, config=config)
     return await _summarize(graph, ticket_id, result, config)
@@ -88,6 +91,12 @@ async def resume_ticket_run(ticket_id: int) -> dict:
     """
     graph = await _get_graph()
     config = _thread_config(ticket_id)
+    # Seed this run's token accounting with what the ticket already spent
+    # before the interrupt (checkpointed by plan/replan) — the budget is
+    # per-ticket, and a resume must not silently grant a fresh allowance.
+    snapshot = await graph.aget_state(config)
+    already_spent = (snapshot.values or {}).get("tokens_used", 0)
+    token_budget.start_accounting(already_spent)
     async with ticket_run_session(ticket_id):
         result = await graph.ainvoke(Command(resume=True), config=config)
     return await _summarize(graph, ticket_id, result, config)

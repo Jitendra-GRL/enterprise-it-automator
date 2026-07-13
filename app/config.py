@@ -103,6 +103,33 @@ class Settings(BaseSettings):
     # documented env var name in .env.example/README.md.
     otel_exporter_endpoint: str = Field(default="", validation_alias="OTEL_EXPORTER_OTLP_ENDPOINT")
 
+    # Stage 4.1 (right-sized): OIDC-verified reviewer identity. Enabled only
+    # when BOTH issuer and audience are set (see oidc_enabled below) — with
+    # them unset (the default) every auth path is exactly the pre-OIDC
+    # behavior (X-Reviewer-Token only) and app/api/oidc.py is never invoked.
+    # oidc_issuer must equal the token's `iss` claim exactly (e.g.
+    # https://keycloak.example.com/realms/it-automator); oidc_audience must
+    # appear in its `aud` claim (the client/API identifier registered in the
+    # IdP). oidc_jwks_url overrides discovery for IdPs whose discovery
+    # document is unreachable from this app (rare); blank means "resolve via
+    # <issuer>/.well-known/openid-configuration".
+    oidc_issuer: str = ""
+    oidc_audience: str = ""
+    oidc_jwks_url: str = ""
+    # Which claim carries the reviewer's username to match against the
+    # reviewers table. preferred_username is Keycloak's default; Auth0
+    # deployments typically want "nickname" or a namespaced custom claim.
+    oidc_username_claim: str = "preferred_username"
+
+    # Hard cap on LLM tokens (input+output, summed over every call) one
+    # ticket may spend across its whole lifecycle, including post-approval
+    # resumes — the token-denominated companion to MAX_REPLANS's loop bound
+    # (see app/agent/token_budget.py). 0 (default) disables the check
+    # entirely; deployments on paid models should set an explicit ceiling
+    # sized to their prompts (a normal run here is low-thousands of tokens,
+    # so e.g. 50000 is roomy without being unbounded).
+    max_tokens_per_ticket: int = 0
+
     # Stage 4.5 (scoped down): how long a sensitive approval may sit PENDING
     # before the background sweep (app/agent/sla_sweep.py) escalates it, and
     # how often that sweep runs.
@@ -141,6 +168,37 @@ class Settings(BaseSettings):
     # a real Telegram webhook configured isn't forced to set this too;
     # any real deployment enabling TELEGRAM_BOT_TOKEN should also set this.
     telegram_webhook_secret: str = ""
+
+    # Optional plain-email notifications for pending approvals (see
+    # app/notifications/email.py) — a lighter-weight alternative to Telegram
+    # for a reviewer who just wants a normal inbox notification, no bot/chat
+    # linking. Blank smtp_host disables the whole feature: same opt-in,
+    # additive, no-op-by-default shape as TELEGRAM_BOT_TOKEN above. Works
+    # with any real SMTP provider (Gmail App Password, etc) — smtplib has no
+    # provider-specific requirements beyond host/port/credentials.
+    smtp_host: str = ""
+    smtp_port: int = 587
+    smtp_username: str = ""
+    smtp_password: str = ""
+    # Distinct from smtp_username because some providers require the
+    # authenticating account to differ from the visible From address (e.g.
+    # a Gmail alias) — defaults to smtp_username when left blank (see
+    # Settings.smtp_from_address_or_default below).
+    smtp_from_address: str = ""
+
+    @property
+    def smtp_from_address_or_default(self) -> str:
+        return self.smtp_from_address or self.smtp_username
+
+    @property
+    def oidc_enabled(self) -> bool:
+        """Fail-closed enablement: BOTH issuer and audience must be set.
+        Issuer alone would verify tokens without an audience check — a token
+        minted for any OTHER app at the same IdP would then pass here
+        (the classic cross-service token-reuse hole), so half-configured
+        OIDC stays OFF rather than on-but-weaker.
+        """
+        return bool(self.oidc_issuer and self.oidc_audience)
 
     @property
     def sensitive_action_set(self) -> set[str]:

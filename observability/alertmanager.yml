@@ -1,0 +1,20 @@
+# Alertmanager for the compose observability profile. Ships with a webhook
+# receiver pointed at nothing (compose-internal placeholder) — wire `page`
+# severity to a real channel (Slack webhook, PagerDuty routing key, SMTP)
+# per deployment; the routing tree below is the part worth keeping.
+route:
+  receiver: default
+  group_by: [alertname]
+  group_wait: 30s
+  group_interval: 5m
+  repeat_interval: 4h
+  routes:
+    - matchers: [severity="page"]
+      receiver: default
+      repeat_interval: 1h
+
+receivers:
+  - name: default
+    webhook_configs:
+      - url: http://127.0.0.1:5001/  # placeholder — replace per deployment
+        send_resolved: true

@@ -16,14 +16,23 @@ import asyncio
 import datetime as dt
 import logging
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 
+from app import metrics
 from app.api.idempotency import purge_expired
 from app.config import get_settings
 from app.db.models import AuditLog, Approval, ApprovalStatus, Ticket, TicketStatus
-from app.db.session import session_scope
+from app.db.session import session_scope, try_advisory_lock
 
 logger = logging.getLogger(__name__)
+
+# Postgres advisory-lock key for the sweep (arbitrary but stable — advisory
+# locks are just int64 namespaces agreed on by convention). Multi-replica
+# deployments (2+ app containers on one Postgres) would otherwise run every
+# pass N times: N duplicate escalation audit rows per overdue approval and
+# N-times-inflated escalation counters. Single-replica/SQLite deployments
+# are unaffected (try_advisory_lock yields True unconditionally there).
+SLA_SWEEP_ADVISORY_LOCK_ID = 74_301
 
 # A ticket sitting in PLANNING/EXECUTING for longer than this is almost
 # certainly stuck (crashed mid-run, orphaned by a process restart before the
@@ -71,8 +80,24 @@ async def sweep_overdue_approvals() -> list[int]:
             escalated_ids.append(approval.id)
 
     if escalated_ids:
+        metrics.APPROVALS_ESCALATED.inc(len(escalated_ids))
         logger.warning("SLA sweep escalated %d overdue approval(s): %s", len(escalated_ids), escalated_ids)
     return escalated_ids
+
+
+async def refresh_pending_approvals_gauge() -> int:
+    """Sets the approvals_pending gauge to the current count of PENDING
+    approvals — a level, not an event, so it's refreshed on the sweep's
+    cadence rather than incremented/decremented at every mutation site
+    (which would drift the moment any path forgot one side of the pair;
+    re-deriving from the DB each pass is self-healing by construction).
+    """
+    async with session_scope() as session:
+        pending = await session.scalar(
+            select(func.count()).select_from(Approval).where(Approval.status == ApprovalStatus.PENDING)
+        )
+    metrics.APPROVALS_PENDING.set(pending or 0)
+    return pending or 0
 
 
 async def sweep_stuck_tickets() -> list[int]:
@@ -126,6 +151,7 @@ async def sweep_stuck_tickets() -> list[int]:
             stuck_ids.append(ticket.id)
 
     if stuck_ids:
+        metrics.STUCK_TICKETS_FAILED.inc(len(stuck_ids))
         logger.warning("SLA sweep marked %d stuck ticket(s) as failed: %s", len(stuck_ids), stuck_ids)
     return stuck_ids
 
@@ -145,13 +171,24 @@ async def run_sla_sweep() -> dict:
     """One full sweep pass — every housekeeping check this app needs run
     periodically, together, since they share the same cadence and the same
     "surface it, don't act on it destructively" policy.
+
+    Cross-replica safe: the whole pass runs under a Postgres advisory lock
+    (no-op on SQLite — see try_advisory_lock), so horizontally scaled
+    deployments get exactly one sweep per interval instead of one per
+    replica. A pass skipped because another replica holds the lock reports
+    skipped=True with empty results — the work IS being done, just not here.
     """
-    escalated = await sweep_overdue_approvals()
-    stuck = await sweep_stuck_tickets()
-    purged = await _purge_expired_idempotency_keys()
-    if purged:
-        logger.info("SLA sweep purged %d expired idempotency key(s)", purged)
-    return {"escalated_approvals": escalated, "stuck_tickets": stuck}
+    async with try_advisory_lock(SLA_SWEEP_ADVISORY_LOCK_ID) as acquired:
+        if not acquired:
+            logger.info("SLA sweep skipped — another replica holds the sweep lock this pass.")
+            return {"escalated_approvals": [], "stuck_tickets": [], "skipped": True}
+        escalated = await sweep_overdue_approvals()
+        stuck = await sweep_stuck_tickets()
+        purged = await _purge_expired_idempotency_keys()
+        await refresh_pending_approvals_gauge()
+        if purged:
+            logger.info("SLA sweep purged %d expired idempotency key(s)", purged)
+        return {"escalated_approvals": escalated, "stuck_tickets": stuck, "skipped": False}
 
 
 async def sla_sweep_loop() -> None:

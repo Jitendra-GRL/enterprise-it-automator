@@ -20,10 +20,26 @@ jobs:
       - name: Install dependencies
         run: |
           pip install -r requirements.lock.txt
-          pip install ruff
+          pip install ruff mypy pip-audit
 
       - name: Lint (ruff)
-        run: ruff check app/ tests/
+        run: ruff check app/ tests/ evals/
 
-      - name: Test (pytest)
-        run: pytest -v
+      - name: Typecheck (mypy)
+        # Config in pyproject [tool.mypy] — checks app/ (the shipped package).
+        run: mypy
+
+      - name: Test with coverage gate (pytest)
+        # fail_under lives in pyproject [tool.coverage.report]: the suite
+        # fails if app/ line coverage drops below the floor. Includes the
+        # golden-ticket eval replay (tests/test_golden_tickets.py) and the
+        # migration-drift gate (tests/test_migrations.py).
+        run: pytest -q --cov --cov-report=term
+
+      - name: Dependency audit (pip-audit)
+        # Audits the LOCKED resolution (what the image actually ships), not
+        # the loose ranges. Strict: a known CVE in a pinned dep fails CI so
+        # the bump is a deliberate, reviewed act. For a vulnerability with
+        # no fixed release yet, add a documented `--ignore-vuln GHSA-...`
+        # with a link to the upstream issue — never silence the whole step.
+        run: pip-audit -r requirements.lock.txt --disable-pip
