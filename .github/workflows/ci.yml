@@ -42,4 +42,14 @@ jobs:
         # the bump is a deliberate, reviewed act. For a vulnerability with
         # no fixed release yet, add a documented `--ignore-vuln GHSA-...`
         # with a link to the upstream issue — never silence the whole step.
-        run: pip-audit -r requirements.lock.txt --disable-pip
+        #
+        # --disable-pip skips using pip to re-resolve/verify the listed
+        # versions (this file is already a fully-resolved lockfile, so
+        # there's nothing left to resolve) — but pip-audit's own CLI
+        # requires pairing it with --no-deps, since without EITHER a
+        # hashed requirements file or --no-deps it has no way to know the
+        # listed versions are the complete, final set to audit rather than
+        # a set that still needs transitive deps pulled in. Without
+        # --no-deps here, pip-audit refuses to run at all (exit 1 before
+        # auditing a single package).
+        run: pip-audit -r requirements.lock.txt --disable-pip --no-deps
