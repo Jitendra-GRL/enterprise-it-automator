@@ -253,19 +253,42 @@ potentially on separate hosts.
 The `stdio` transport needs none of this (the spawned subprocess inherits
 trust from its parent process, per MCP spec 2025-11-25). The `http`
 transport is reachable by any network client that can route to it, so
-`app/mcp_server/server.py` layers on three independent protections —
-**all three are already implemented; this is deployment guidance, not a
+`app/mcp_server/server.py` layers on four independent protections —
+**all four are already implemented; this is deployment guidance, not a
 TODO list**:
 
 1. **Bearer-token auth** (`MCP_SERVER_TOKEN`) — required or the transport
    refuses to start. FastMCP applies no authentication of its own.
-2. **DNS-rebinding protection** (`MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS`)
+2. **Scoped, short-lived token exchange** (`app/mcp_server/token_exchange.py`)
+   — `MCP_SERVER_TOKEN` is the ADMIN credential (full access, unchanged);
+   it's also the only credential that can call `POST /token/exchange`
+   (`{"scopes": ["identity", "access"]}`) to mint a domain-scoped JWT
+   (`MCP_SCOPED_TOKEN_TTL_SECONDS`, default 300s). A `tools/call` for a
+   tool outside a scoped token's domains gets `403 insufficient_scope`
+   (`WWW-Authenticate: Bearer error="insufficient_scope"`) before it ever
+   reaches the tool. `app/agent/mcp_client.py` uses this automatically for
+   the HTTP transport — the agent's own shared per-ticket session requests
+   a token covering every domain (an offboarding ticket calls both
+   `identity_disable_user` and `access_revoke_access` through the same
+   session, so it needs all of them; see that module's docstring), but the
+   raw admin secret is no longer sent on every tool call — only once per
+   token exchange, with everything after using a credential that expires
+   in minutes if it ever leaks. This is a right-sized, **self-issued**
+   token exchange between two processes that already share a trust root
+   (`MCP_SERVER_TOKEN`), not full OAuth 2.1: no external IdP, no
+   user-facing PKCE authorization-code flow, no RFC 9728 Protected
+   Resource Metadata discovery document — those remain explicitly
+   descoped as disproportionate to this project (see
+   `token_exchange.py`'s module docstring for the full rationale, the same
+   shape as right-sizing OIDC below instead of standing up a full
+   Keycloak deployment).
+3. **DNS-rebinding protection** (`MCP_ALLOWED_HOSTS` / `MCP_ALLOWED_ORIGINS`)
    — the mcp SDK's own `TransportSecuritySettings`, validating the `Host`
    and `Origin` headers on every request. Defaults to loopback-only; set
    both explicitly if you front the gateway with a real hostname (see
    `docker-compose.yml`'s `mcp-server` service for a worked example using
    Docker's internal DNS name).
-3. **Per-tool rate limiting** (`app/mcp_server/rate_limit.py`) — a token
+4. **Per-tool rate limiting** (`app/mcp_server/rate_limit.py`) — a token
    bucket per tool name, independent of the FastAPI layer's `slowapi`
    limits (which only cover `POST /tickets` and the approval-decision
    endpoint, not direct MCP tool calls).
