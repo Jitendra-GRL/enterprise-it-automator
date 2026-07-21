@@ -65,7 +65,7 @@ googleapis-common-protos==1.75.0
     # via opentelemetry-exporter-otlp-proto-http
 greenlet==3.5.3
     # via sqlalchemy
-groq==1.5.0
+groq==0.37.1
     # via langchain-groq
 gunicorn==26.0.0
     # via -r requirements.txt
@@ -89,13 +89,13 @@ httpx==0.28.1
     #   openai
 httpx-sse==0.4.3
     # via mcp
-ibm-cos-sdk==2.16.2
+ibm-cos-sdk==2.14.3
     # via ibm-watsonx-ai
-ibm-cos-sdk-core==2.16.2
+ibm-cos-sdk-core==2.14.3
     # via
     #   ibm-cos-sdk
     #   ibm-cos-sdk-s3transfer
-ibm-cos-sdk-s3transfer==2.16.2
+ibm-cos-sdk-s3transfer==2.14.3
     # via ibm-cos-sdk
 ibm-watsonx-ai==1.6.0
     # via langchain-ibm
@@ -110,7 +110,7 @@ jiter==0.16.0
     # via
     #   anthropic
     #   openai
-jmespath==1.1.0
+jmespath==1.0.1
     # via
     #   ibm-cos-sdk
     #   ibm-cos-sdk-core
@@ -214,7 +214,7 @@ packaging==26.2
     #   langsmith
     #   limits
     #   pytest
-pandas==3.0.3
+pandas==2.3.3
     # via ibm-watsonx-ai
 pluggy==1.6.0
     # via
@@ -250,7 +250,7 @@ pydantic==2.13.4
     #   mcp
     #   openai
     #   pydantic-settings
-pydantic-core==2.47.0
+pydantic-core==2.46.4
     # via pydantic
 pydantic-settings==2.14.2
     # via
@@ -387,7 +387,7 @@ uvloop==0.22.1
     # via uvicorn
 watchfiles==1.2.0
     # via uvicorn
-websockets==16.1.1
+websockets==15.0.1
     # via
     #   langgraph-sdk
     #   langsmith
