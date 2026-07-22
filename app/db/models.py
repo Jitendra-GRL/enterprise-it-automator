@@ -78,6 +78,51 @@ class EmployeeUser(Base):
     # used by app/agent/demo_purge.py to hard-delete these rows alongside
     # the demo client's tickets/approvals/audit entries.
     owned_by_client_id: Mapped[int | None] = mapped_column(ForeignKey("api_clients.id"), nullable=True)
+
+
+class AppAccessStatus(str, enum.Enum):
+    ACTIVE = "active"
+    REVOKED = "revoked"
+
+
+class AppAccessGrant(Base):
+    """Real per-application access state (Jira, Slack, Salesforce, Google
+    Workspace email, GitHub, Workday, NetSuite, ...) — distinct from
+    EmployeeUser.access_grants (a flat, untyped list of resource strings
+    used by the generic access_grant_access/revoke_access tools for
+    arbitrary resources like "vpn" or "admin-panel"). That flat list has
+    no per-item metadata: no granted/revoked timestamp, no "which ticket
+    granted this," and no way to answer "does this person currently have
+    Slack" without string-matching a list — this table exists specifically
+    to answer that question for a fixed, named catalog of real SaaS apps.
+
+    One ROW PER GRANT EVENT rather than deleting on revoke (same pattern
+    as Approval/Ticket using a status enum, not row deletion) — a
+    grant-revoke-regrant cycle over an employee's tenure is a real,
+    expected lifecycle (e.g. Slack access removed during a leave, restored
+    on return), and preserving that full history is a stronger audit story
+    than the flat list this table is meant to improve on ever offered.
+    """
+
+    __tablename__ = "app_access_grants"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    username: Mapped[str] = mapped_column(String(64), index=True)
+    # Not a DB-level enum/FK to a fixed apps table — app/mcp_server/tools.py's
+    # APP_CATALOG is the single source of truth for which names are valid,
+    # checked in code before a row is ever written (same "hand-configured
+    # set, validated in code" pattern as SENSITIVE_ACTIONS/TOOLS_ACCEPTING_TICKET_ID).
+    # A plain indexed string column keeps adding a new app to the catalog a
+    # code-only change, no migration required.
+    app_name: Mapped[str] = mapped_column(String(64), index=True)
+    status: Mapped[AppAccessStatus] = mapped_column(
+        Enum(AppAccessStatus), default=AppAccessStatus.ACTIVE
+    )
+    granted_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    granted_by_ticket_id: Mapped[int | None] = mapped_column(
+        ForeignKey("tickets.id"), nullable=True
+    )
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
     updated_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=utcnow, onupdate=utcnow

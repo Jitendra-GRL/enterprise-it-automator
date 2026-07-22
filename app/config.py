@@ -224,6 +224,24 @@ class Settings(BaseSettings):
     def smtp_from_address_or_default(self) -> str:
         return self.smtp_from_address or self.smtp_username
 
+    # Voice-to-ticket: POST /tickets/transcribe (app/agent/transcription.py)
+    # sends an uploaded audio clip to Groq's Whisper endpoint and returns
+    # the transcript as plain text — the caller then submits that text
+    # through the existing POST /tickets unchanged, so it inherits the same
+    # prompt-injection framing/validation ticket text already gets, rather
+    # than being a second, less-guarded way to get text into the planner.
+    # No separate opt-in flag: this reuses groq_api_key (the same credential
+    # the default LLM_PROVIDER=groq setup already requires), so the feature
+    # is simply available whenever that's set, same as classification/
+    # planning already are — a deployment on a different LLM_PROVIDER with
+    # no Groq key configured gets a clear 503 (see the endpoint) rather
+    # than a confusing failure deep inside a transcription call.
+    stt_model: str = "whisper-large-v3-turbo"
+    # 25MB matches Groq/OpenAI's own Whisper upload limit — rejecting an
+    # oversized file locally (413) is a clearer failure than letting Groq's
+    # API reject it after a full upload completes.
+    stt_max_upload_bytes: int = 25 * 1024 * 1024
+
     @property
     def oidc_enabled(self) -> bool:
         """Fail-closed enablement: BOTH issuer and audience must be set.

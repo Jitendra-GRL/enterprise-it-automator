@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import cast
 
 from ag_ui.encoder import EventEncoder
-from fastapi import Depends, FastAPI, Header, HTTPException, Request, Response
+from fastapi import Depends, FastAPI, File, Header, HTTPException, Request, Response, UploadFile
 from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from slowapi import Limiter, _rate_limit_exceeded_handler
 from slowapi.errors import RateLimitExceeded
@@ -22,6 +22,7 @@ from app.agent.ag_ui_bridge import stream_resume_run, stream_ticket_run
 from app.agent.demo_purge import demo_purge_loop, reset_demo_data_if_due
 from app.agent.runner import resume_ticket_run, start_ticket_run
 from app.agent.sla_sweep import run_sla_sweep, sla_sweep_loop
+from app.agent.transcription import TranscriptionUnavailableError, transcribe_audio
 from app.api.auth import AuthenticatedReviewer, require_api_client, require_reviewer
 from app.api.idempotency import get_cached_response, store_response
 from app.api.rbac import ApprovalNotAuthorizedError, authorize_reviewer
@@ -36,6 +37,7 @@ from app.api.schemas import (
     SlaSweepResult,
     TicketCreate,
     TicketOut,
+    TranscriptionResult,
 )
 from app.config import get_settings
 from app.db.models import (
@@ -502,6 +504,51 @@ async def submit_ticket_stream(
             yield encoder.encode(event)
 
     return StreamingResponse(event_source(), media_type=encoder.get_content_type())
+
+
+@app.post("/tickets/transcribe", response_model=TranscriptionResult)
+@limiter.limit("20/minute")
+async def transcribe_ticket_audio(
+    request: Request,
+    audio: UploadFile = File(...),
+    client: ApiClient | None = Depends(require_api_client),
+) -> TranscriptionResult:
+    """Voice-to-ticket: transcribes an uploaded audio clip to text via
+    Groq's Whisper endpoint (app/agent/transcription.py) and returns the
+    text ONLY — this never creates a ticket itself. The caller (the
+    dashboard's mic button, or any API client) submits the returned text
+    through the existing POST /tickets unchanged, so a voice-submitted
+    ticket goes through the exact same prompt-injection framing/validation
+    as a typed one, with no separate, less-guarded path into the planner.
+
+    Shares POST /tickets' daily-request-cap and org-token-budget checks
+    (this costs real Groq API spend per call, same abuse surface) even
+    though it's a distinct endpoint — a caller couldn't otherwise bypass
+    those by routing spend through transcription instead of tickets.
+    """
+    await _check_and_increment_daily_request_count(client)
+    await _check_client_org_token_budget(client)
+
+    settings = get_settings()
+    audio_bytes = await audio.read()
+    if len(audio_bytes) > settings.stt_max_upload_bytes:
+        raise HTTPException(
+            413,
+            f"Audio file too large ({len(audio_bytes)} bytes) — "
+            f"{settings.stt_max_upload_bytes} byte limit.",
+        )
+    if not audio_bytes:
+        raise HTTPException(400, "Uploaded audio file is empty.")
+
+    try:
+        text = await transcribe_audio(audio_bytes, audio.filename or "audio")
+    except TranscriptionUnavailableError as exc:
+        raise HTTPException(503, str(exc)) from exc
+    except Exception as exc:
+        logger.exception("Transcription failed for an uploaded audio file")
+        raise HTTPException(502, f"Transcription failed: {exc}") from exc
+
+    return TranscriptionResult(text=text)
 
 
 def _client_may_see_ticket(client: ApiClient | None, ticket: Ticket) -> bool:

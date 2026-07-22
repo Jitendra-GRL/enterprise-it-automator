@@ -106,3 +106,7 @@ class SlaSweepResult(BaseModel):
 
 class DemoResetResult(BaseModel):
     tickets_purged: int
+
+
+class TranscriptionResult(BaseModel):
+    text: str

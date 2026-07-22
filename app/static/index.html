@@ -261,7 +261,12 @@
       <input id="requester" value="hr@example.com" />
       <label for="subject">Subject</label>
       <input id="subject" value="Onboard employee" />
-      <label for="body">Body</label>
+      <div style="display:flex; justify-content:space-between; align-items:center;">
+        <label for="body" style="margin-bottom:0;">Body</label>
+        <button type="button" id="micBtn" class="link-btn" title="Dictate the ticket body" style="text-decoration:none; display:flex; align-items:center; gap:4px;" onclick="toggleDictation()">
+          <span id="micIcon">🎙️</span><span id="micLabel">Dictate</span>
+        </button>
+      </div>
       <textarea id="body">Onboard adoe - Alex Doe, Engineering. Create their account and set up default access.</textarea>
       <div class="row">
         <button id="submitBtn" onclick="submitTicket()">Submit Ticket</button>
@@ -464,6 +469,67 @@ async function submitTicket() {
   } finally {
     btn.disabled = false;
   }
+}
+
+// --- Voice-to-ticket dictation ---------------------------------------------
+// Records via MediaRecorder, uploads the resulting blob to
+// POST /tickets/transcribe (multipart — NOT the JSON api() helper above,
+// since a browser-set multipart boundary in Content-Type must not be
+// overridden), and appends the returned text into the Body textarea. This
+// never submits a ticket itself — the existing Submit button still does
+// that, from the same textarea, so a voice-dictated ticket goes through
+// literally the same code path as a typed one.
+let dictationRecorder = null;
+let dictationChunks = [];
+
+async function toggleDictation() {
+  if (dictationRecorder && dictationRecorder.state === "recording") {
+    dictationRecorder.stop();
+    return;
+  }
+  if (!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia) {
+    toast("Microphone access isn't available in this browser/context (requires HTTPS or localhost).", true);
+    return;
+  }
+  let stream;
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+  } catch (e) {
+    toast("Microphone permission denied or unavailable: " + e.message, true);
+    return;
+  }
+
+  dictationChunks = [];
+  dictationRecorder = new MediaRecorder(stream);
+  dictationRecorder.ondataavailable = (e) => { if (e.data.size > 0) dictationChunks.push(e.data); };
+  dictationRecorder.onstop = async () => {
+    stream.getTracks().forEach((t) => t.stop());
+    document.getElementById("micIcon").textContent = "⏳";
+    document.getElementById("micLabel").textContent = "Transcribing…";
+    try {
+      const blob = new Blob(dictationChunks, { type: dictationRecorder.mimeType || "audio/webm" });
+      const form = new FormData();
+      form.append("audio", blob, "dictation.webm");
+      const headers = {};
+      const key = apiKeyInput.value;
+      if (key) headers["X-API-Key"] = key;
+      const res = await fetch(API + "/tickets/transcribe", { method: "POST", headers, body: form });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) throw new Error(data.detail ? JSON.stringify(data.detail) : res.statusText);
+      const bodyEl = document.getElementById("body");
+      bodyEl.value = bodyEl.value.trim() ? bodyEl.value.trim() + " " + data.text : data.text;
+      toast("Dictation transcribed into the ticket body.");
+    } catch (e) {
+      toast("Transcription failed: " + e.message, true);
+    } finally {
+      document.getElementById("micIcon").textContent = "🎙️";
+      document.getElementById("micLabel").textContent = "Dictate";
+      dictationRecorder = null;
+    }
+  };
+  dictationRecorder.start();
+  document.getElementById("micIcon").textContent = "⏹️";
+  document.getElementById("micLabel").textContent = "Stop (recording…)";
 }
 
 async function decide(approvalId, approve) {
