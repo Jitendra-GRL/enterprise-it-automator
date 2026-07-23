@@ -59,6 +59,14 @@ jobs:
         with:
           image-ref: ghcr.io/${{ steps.image.outputs.name }}:scan-candidate
           format: table
+          # Explicit, not relying on auto-detection of a bare .trivyignore
+          # at the repo root — trivy-action has multiple open upstream
+          # issues where ignore-file auto-detection doesn't reliably fire
+          # inside a containerized scan step. See .trivyignore's own
+          # comment for what this suppresses and why (a confirmed secret-
+          # scanner false positive in third-party ibm-watsonx-ai source,
+          # not a real credential).
+          trivyignores: .trivyignore
           # Gate on fixable HIGH/CRITICAL OS+library vulns: failing on
           # unfixable ones would just wedge every deploy until upstream
           # ships a patch nobody can apply yet.
