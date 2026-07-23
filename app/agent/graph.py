@@ -285,6 +285,42 @@ MAX_PLAN_LENGTH = 25
 # server-side previously enforced that.
 _USERNAME_PATTERN = re.compile(r"^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$")
 
+# Deliberately conservative — false-rejecting a real, terse ticket ("disable
+# jsmith" is 15 chars, fully actionable) is worse than the problem this
+# closes (spending 2-3 real LLM calls on a body with no name/request in it
+# at all, e.g. "Hi." — confirmed live, that exact case round-tripped
+# through classify + extract_username + plan before concluding, correctly
+# but expensively, that nothing was actionable). This only catches bodies
+# that couldn't possibly name a person or action: too short even for the
+# shortest real username, or pure greeting/placeholder text with nothing
+# else. Anything with real substance, however brief, still goes through
+# the full classify/plan pipeline as before — this is a fast-path for the
+# obvious-empty case, not a second content filter competing with the LLM's
+# own judgment.
+_MIN_ACTIONABLE_BODY_LENGTH = 8
+_NON_ACTIONABLE_BODY_PHRASES = frozenset({
+    "hi", "hello", "hey", "test", "testing", "ping", "hi.", "hello.",
+    "hey.", "test.", "n/a", "na", "none", "nothing", "asdf", "hello there",
+})
+
+
+def _looks_actionable(ticket_text: str) -> bool:
+    """Pure heuristic, no LLM call — see the module comment above this
+    function for the false-reject risk this is deliberately biased against.
+    ticket_text is "Subject: ...\n\n<body>" (see start_ticket_run/graph.py's
+    ticket_text construction) — checked on the BODY portion only, since the
+    subject is free-text the requester controls and "Onboard employee" as a
+    subject with an empty body is exactly the case this exists to catch,
+    not to be fooled by.
+    """
+    body = ticket_text.split("\n\n", 1)[1] if "\n\n" in ticket_text else ticket_text
+    stripped = body.strip()
+    if len(stripped) < _MIN_ACTIONABLE_BODY_LENGTH:
+        return False
+    if stripped.lower().rstrip(".!? ") in _NON_ACTIONABLE_BODY_PHRASES:
+        return False
+    return True
+
 
 def _extract_json_array(text: str) -> list[dict]:
     """Best-effort structural parsing guardrail against markdown fences /
@@ -517,6 +553,27 @@ async def classify_ticket_category(llm, ticket_text: str) -> TicketCategory:
         return normalized  # type: ignore[return-value]
     logger.warning("Classifier produced unexpected category %r, defaulting to ACCESS_CHANGE", raw)
     return "ACCESS_CHANGE"
+
+
+def check_actionable_node(state: AgentState) -> dict:
+    """Entry-point gate, before classify_node — zero LLM calls. See
+    _looks_actionable's module comment for the false-reject risk this is
+    deliberately biased against and the live case (ticket body "Hi.")
+    that motivated it: that ticket correctly, but expensively, round-
+    tripped through classify + extract_username + plan (3 real LLM calls)
+    before concluding nothing was actionable. Anything with real content
+    still goes through the full pipeline unchanged; this only short-
+    circuits the obvious-empty case.
+    """
+    if _looks_actionable(state["ticket_text"]):
+        return {}
+    return {"plan": [], "done": True}
+
+
+def route_after_actionable_check(state: AgentState) -> str:
+    if state.get("done"):
+        return "finalize"
+    return "classify"
 
 
 async def classify_node(state: AgentState) -> dict:
@@ -1084,6 +1141,7 @@ def build_graph():
     # names (e.g. monkeypatch.setattr(graph_module, "plan_node", ...)) keep
     # working unchanged — build_graph() picks up whatever the name currently
     # points to, patched or original, and traces that.
+    graph.add_node("check_actionable", trace_graph_node("check_actionable")(check_actionable_node))
     graph.add_node("classify", trace_graph_node("classify")(classify_node), retry_policy=AGENT_RETRY_POLICY)
     graph.add_node("plan", trace_graph_node("plan")(plan_node), retry_policy=AGENT_RETRY_POLICY)
     graph.add_node("route_step", route_step)
@@ -1107,7 +1165,10 @@ def build_graph():
         "finalize": "finalize",
     }
 
-    graph.set_entry_point("classify")
+    graph.set_entry_point("check_actionable")
+    graph.add_conditional_edges(
+        "check_actionable", route_after_actionable_check, {"classify": "classify", "finalize": "finalize"}
+    )
     graph.add_conditional_edges("classify", route_after_classify, {"plan": "plan"})
     graph.add_conditional_edges("plan", route_after_plan, {"route_step": "route_step", "finalize": "finalize"})
     graph.add_conditional_edges("route_step", route_after_step_check, step_check_map)
