@@ -34,6 +34,21 @@ prometheus-client>=0.25.0
 # backend (cryptography) is present.
 PyJWT[crypto]>=2.10.0
 alembic>=1.16.0
+# Pinned to a pre-release: 1.93.0 (latest stable as of this writing) has no
+# published Windows wheel and fails to build from source without a Rust
+# toolchain (confirmed against PyPI's release file listing) — 1.94.0rc3 is
+# the first release with one. Used ONLY as a local, offline cost-calculator
+# utility (litellm.cost_per_token against its bundled static pricing table)
+# — NOT as a request gateway/router; this project's own provider-fallback
+# logic in app/agent/llm.py is unchanged. Revisit this pin once a stable
+# >=1.94.0 ships.
+litellm>=1.94.0rc3
+# evals/run_reasoning_quality.py's GEval-based judge — a second,
+# independent (graded, not exact-match) quality signal alongside
+# evals/golden.py's mechanical scoring. Judge model is this project's OWN
+# configured LLM (evals/deepeval_judge.py), not OpenAI's default, so this
+# adds no new API cost/credential surface.
+deepeval>=4.1.0
 pytest>=8.3.4
 pytest-asyncio>=0.25.1
 pytest-cov>=7.0.0

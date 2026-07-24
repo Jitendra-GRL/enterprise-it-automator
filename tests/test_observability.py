@@ -11,8 +11,16 @@ from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import SimpleSpanProcessor
 from opentelemetry.sdk.trace.export.in_memory_span_exporter import InMemorySpanExporter
 from opentelemetry.trace import StatusCode
+from prometheus_client import REGISTRY
 
 from app.observability import record_llm_call, record_tool_call, trace_graph_node
+
+
+def _sample(name: str, labels: dict | None = None) -> float:
+    # Same delta-based-assertion rationale as test_metrics.py's helper:
+    # prometheus_client's registry is process-global across the whole test
+    # session, so absolute values depend on test ordering.
+    return REGISTRY.get_sample_value(name, labels or {}) or 0.0
 
 
 # OTel's global API only allows trace.set_tracer_provider() to succeed
@@ -148,6 +156,65 @@ async def test_configure_observability_is_idempotent(monkeypatch):
     monkeypatch.setattr(observability, "_configured", False)
     observability.configure_observability()
     observability.configure_observability()
+
+
+async def test_record_llm_call_records_cost_for_a_priced_anthropic_model(span_exporter):
+    """claude-sonnet-4-5 is confirmed present verbatim (no provider prefix
+    needed) in litellm's bundled model_prices_and_context_window.json —
+    checked directly against the file, not assumed."""
+    tracer = trace.get_tracer("test")
+
+    class _FakeResponse:
+        usage_metadata = {"input_tokens": 1000, "output_tokens": 500}
+
+    before = _sample("llm_cost_usd_total", {"model": "claude-sonnet-4-5"})
+    with tracer.start_as_current_span("test-span"):
+        record_llm_call("plan", "claude-sonnet-4-5", _FakeResponse())
+    after = _sample("llm_cost_usd_total", {"model": "claude-sonnet-4-5"})
+
+    assert after > before
+
+
+async def test_record_llm_call_records_cost_for_a_groq_model_via_provider_prefix(span_exporter):
+    """'llama-3.1-8b-instant' (this project's bare groq_model config value)
+    is NOT itself a key in litellm's pricing table — only the prefixed
+    'groq/llama-3.1-8b-instant' is (confirmed directly against
+    model_prices_and_context_window.json). This is the specific case
+    _litellm_model_candidates exists to handle."""
+    tracer = trace.get_tracer("test")
+
+    class _FakeResponse:
+        usage_metadata = {"input_tokens": 1000, "output_tokens": 500}
+
+    before = _sample("llm_cost_usd_total", {"model": "llama-3.1-8b-instant"})
+    with tracer.start_as_current_span("test-span"):
+        record_llm_call("plan", "llama-3.1-8b-instant", _FakeResponse())
+    after = _sample("llm_cost_usd_total", {"model": "llama-3.1-8b-instant"})
+
+    assert after > before
+
+
+async def test_record_llm_call_marks_unknown_model_as_unpriced_not_zero_cost(span_exporter):
+    """A model litellm's pricing table has no entry for at all (under any
+    of this project's known provider prefixes) must be counted as
+    unpriced, never silently recorded as $0 cost — those two states look
+    identical on a dashboard unless kept as separate metrics."""
+    tracer = trace.get_tracer("test")
+
+    class _FakeResponse:
+        usage_metadata = {"input_tokens": 1000, "output_tokens": 500}
+
+    cost_before = _sample("llm_cost_usd_total", {"model": "totally-unknown-model-xyz"})
+    unpriced_before = _sample("llm_cost_unpriced_calls_total", {"model": "totally-unknown-model-xyz"})
+    with tracer.start_as_current_span("test-span"):
+        record_llm_call("plan", "totally-unknown-model-xyz", _FakeResponse())
+    cost_after = _sample("llm_cost_usd_total", {"model": "totally-unknown-model-xyz"})
+    unpriced_after = _sample(
+        "llm_cost_unpriced_calls_total", {"model": "totally-unknown-model-xyz"}
+    )
+
+    assert cost_after == cost_before
+    assert unpriced_after == unpriced_before + 1
 
 
 async def test_no_op_when_otel_endpoint_unset(monkeypatch):

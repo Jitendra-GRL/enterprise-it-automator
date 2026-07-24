@@ -32,6 +32,14 @@ dependencies = [
     "prometheus-client>=0.25.0",
     "PyJWT[crypto]>=2.10.0",
     "alembic>=1.16.0",
+    # Pinned to a pre-release specifically: 1.93.0 (latest STABLE as of
+    # this writing) has no published Windows wheel and fails to build
+    # from source on Windows without a Rust toolchain (confirmed against
+    # PyPI's release file listing) — 1.94.0rc3 is the first release with
+    # one. Revisit this pin once a stable >=1.94.0 ships; the >= bound
+    # plus this being a well-known, widely-used package makes a stale
+    # rc pin a low, temporary risk rather than a permanent one.
+    "litellm>=1.94.0rc3",
 ]
 
 [project.optional-dependencies]

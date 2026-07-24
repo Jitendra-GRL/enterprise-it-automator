@@ -155,6 +155,29 @@ LLM_FALLBACK_TOTAL = Counter(
     ["primary", "served_by"],
 )
 
+LLM_COST_USD = Counter(
+    "llm_cost_usd_total",
+    "Estimated USD cost of LLM calls, by model — computed locally via "
+    "litellm's bundled static pricing table (litellm.cost_per_token), no "
+    "network call and no per-provider API involvement (see "
+    "app/observability.py's record_llm_call). Zero for any model not in "
+    "litellm's pricing map (see LLM_COST_UNPRICED_TOTAL below) rather than "
+    "silently estimating — a wrong-but-plausible-looking cost number is "
+    "worse than an honestly-absent one.",
+    ["model"],
+)
+
+LLM_COST_UNPRICED_TOTAL = Counter(
+    "llm_cost_unpriced_calls_total",
+    "LLM calls whose token cost could NOT be estimated because the model "
+    "isn't in litellm's bundled pricing table — a nonzero rate here means "
+    "LLM_COST_USD is undercounting actual spend for that model (e.g. a "
+    "self-hosted or newly-released model litellm's static table hasn't "
+    "caught up to yet). Not itself a failure signal, just a completeness "
+    "caveat on the cost gauge.",
+    ["model"],
+)
+
 
 def render_metrics() -> tuple[bytes, str]:
     """Returns (payload, content_type) for GET /metrics. In multiprocess

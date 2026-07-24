@@ -120,6 +120,57 @@ def trace_graph_node(node_name: str) -> Callable[[F], F]:
     return decorator
 
 
+def _litellm_model_candidates(model: str) -> list[str]:
+    """litellm's bundled pricing table keys most non-OpenAI/Anthropic
+    models by '<provider>/<model>' (confirmed by inspecting
+    model_prices_and_context_window.json directly: 'llama-3.1-8b-instant'
+    is NOT a key, but 'groq/llama-3.1-8b-instant' is; likewise
+    'watsonx/ibm/granite-3-8b-instruct' vs the bare 'ibm/granite-3-8b-instruct').
+    record_llm_call only receives the bare model string (see
+    _served_model_name in app/agent/graph.py — provider identity isn't
+    plumbed through), so this tries the bare name first (correct for
+    Anthropic, e.g. 'claude-sonnet-4-5'), then each of this project's own
+    configured provider prefixes — cheap to try all of them in order
+    since a mismatch is just a dict miss, not an error, until
+    litellm.cost_per_token is actually called with the first one that's a
+    real hit.
+    """
+    return [model, f"groq/{model}", f"watsonx/{model}", f"openrouter/{model}"]
+
+
+def _record_estimated_cost(model: str, input_tokens: int, output_tokens: int) -> None:
+    """Estimates this call's USD cost via litellm's bundled static pricing
+    table (litellm.cost_per_token) — pure local computation against a
+    dictionary shipped in the litellm package, no network call and no
+    dependency on litellm's proxy/router (this project uses its OWN
+    provider-fallback logic in app/agent/llm.py; litellm is used here
+    ONLY as a cost-calculation utility, not as a request gateway — see
+    that module's docstring for why its circuit-breaker-integrated
+    fallback isn't being replaced).
+
+    litellm.cost_per_token raises when a model string isn't in its
+    pricing map — expected and handled for OpenRouter's free-tier model
+    specifically (genuinely $0 real cost, correctly unpriced rather than
+    estimated as zero, which would look identical to "not measured" in
+    a dashboard) and for any future model litellm's table hasn't caught
+    up to yet. Recorded as LLM_COST_UNPRICED_TOTAL rather than silently
+    guessing or raising into the LLM call path — a broken cost estimate
+    must never be able to break an actual ticket run.
+    """
+    import litellm
+
+    for candidate in _litellm_model_candidates(model):
+        try:
+            input_cost, output_cost = litellm.cost_per_token(
+                model=candidate, prompt_tokens=input_tokens, completion_tokens=output_tokens
+            )
+        except Exception:
+            continue
+        metrics.LLM_COST_USD.labels(model=model).inc(input_cost + output_cost)
+        return
+    metrics.LLM_COST_UNPRICED_TOTAL.labels(model=model).inc()
+
+
 def record_llm_call(span_name: str, model: str, response) -> None:
     """Records token usage for an LLM call on the current span, using
     OTel's GenAI semantic convention attribute names (gen_ai.*) so this
@@ -145,6 +196,8 @@ def record_llm_call(span_name: str, model: str, response) -> None:
             metrics.LLM_TOKENS.labels(model=model, direction="input").inc(input_tokens)
         if output_tokens:
             metrics.LLM_TOKENS.labels(model=model, direction="output").inc(output_tokens)
+        if input_tokens or output_tokens:
+            _record_estimated_cost(model, input_tokens, output_tokens)
         # Imported here, not at module top: token_budget imports app.config,
         # and keeping observability import-light avoids ordering surprises
         # for the several modules that import it first thing.
